@@ -28,6 +28,16 @@ type OverlayOptionsConfig struct {
 	SkipMountHome string `toml:"skip_mount_home,omitempty"`
 	// Specify whether composefs must be used to mount the data layers
 	UseComposefs string `toml:"use_composefs,omitempty"`
+	// Specify whether EROFS must be used to mount the data layers
+	UseEROFS string `toml:"use_erofs,omitempty"`
+	// Enable EROFS UID/GID squashing (rootless mode only)
+	EROFSForceIDs string `toml:"erofs_force_ids,omitempty"`
+	// UID to squash all files to in EROFS volumes
+	EROFSForceUID string `toml:"erofs_force_uid,omitempty"`
+	// GID to squash all files to in EROFS volumes
+	EROFSForceGID string `toml:"erofs_force_gid,omitempty"`
+	// EROFS compression algorithm to use
+	EROFSCompressionAlgorithm string `toml:"erofs_compression_algorithm,omitempty"`
 	// ForceMask indicates the permissions mask (e.g. "0755") to use for new
 	// files and directories
 	ForceMask string `toml:"force_mask,omitempty"`
@@ -176,6 +186,21 @@ func GetGraphDriverOptions(driverName string, options OptionsConfig) []string {
 		}
 		if options.Overlay.UseComposefs != "" {
 			doptions = append(doptions, fmt.Sprintf("%s.use_composefs=%s", driverName, options.Overlay.UseComposefs))
+		}
+		if options.Overlay.UseEROFS != "" {
+			doptions = append(doptions, fmt.Sprintf("%s.use_erofs=%s", driverName, options.Overlay.UseEROFS))
+		}
+		if options.Overlay.EROFSForceIDs != "" {
+			doptions = append(doptions, fmt.Sprintf("%s.erofs_force_ids=%s", driverName, options.Overlay.EROFSForceIDs))
+		}
+		if options.Overlay.EROFSForceUID != "" {
+			doptions = append(doptions, fmt.Sprintf("%s.erofs_force_uid=%s", driverName, options.Overlay.EROFSForceUID))
+		}
+		if options.Overlay.EROFSForceGID != "" {
+			doptions = append(doptions, fmt.Sprintf("%s.erofs_force_gid=%s", driverName, options.Overlay.EROFSForceGID))
+		}
+		if options.Overlay.EROFSCompressionAlgorithm != "" {
+			doptions = append(doptions, fmt.Sprintf("%s.erofs_compression_algorithm=%s", driverName, options.Overlay.EROFSCompressionAlgorithm))
 		}
 	case "vfs":
 		if options.Vfs.IgnoreChownErrors != "" {

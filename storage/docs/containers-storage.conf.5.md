@@ -219,6 +219,20 @@ based file systems.
     Use ComposeFS to mount the data layers image.  ComposeFS support is experimental and not recommended for production use.
     This is a "string bool": "false"|"true" (cannot be native TOML boolean)
 
+**use_erofs** = "false"
+    Use EROFS to mount the data layers.  EROFS (Enhanced Read-Only File System) stores container layers as compressed read-only filesystem images, avoiding tarball extraction and reducing storage space. Requires mkfs.erofs for creating EROFS layers and erofsfuse for rootless mounting. EROFS support is experimental.
+    This is a "string bool": "false"|"true" (cannot be native TOML boolean)
+
+**erofs_force_ids** = "false"
+    Enable EROFS UID/GID squashing (rootless mode only). When enabled, all files in EROFS volumes will have their UID/GID set to the specified values using mkfs.erofs --force-uid and --force-gid flags. This is useful in rootless mode where user namespaces aren't available, allowing containers to run with consistent file ownership. In rootful mode, this option will be ignored with a warning logged.
+    This is a "string bool": "false"|"true" (cannot be native TOML boolean)
+
+**erofs_force_uid** = ""
+    UID to squash all files to in EROFS volumes (defaults to current user UID). Only effective when erofs_force_ids is enabled and running in rootless mode. When not specified and erofs_force_ids is true, defaults to the UID of the process creating the EROFS layer.
+
+**erofs_force_gid** = ""
+    GID to squash all files to in EROFS volumes (defaults to current user GID). Only effective when erofs_force_ids is enabled and running in rootless mode. When not specified and erofs_force_ids is true, defaults to the GID of the process creating the EROFS layer.
+
 
 ### STORAGE OPTIONS FOR VFS TABLE
 

@@ -105,15 +105,20 @@ const (
 )
 
 type overlayOptions struct {
-	imageStores       []string
-	layerStores       []additionalLayerStore
-	quota             quota.Quota
-	mountProgram      string
-	skipMountHome     bool
-	mountOptions      string
-	ignoreChownErrors bool
-	forceMask         *os.FileMode
-	useComposefs      bool
+	imageStores               []string
+	layerStores               []additionalLayerStore
+	quota                     quota.Quota
+	mountProgram              string
+	skipMountHome             bool
+	mountOptions              string
+	ignoreChownErrors         bool
+	forceMask                 *os.FileMode
+	useComposefs              bool
+	useEROFS                  bool
+	erofsForceIDs             bool
+	erofsForceUID             string
+	erofsForceGID             string
+	erofsCompressionAlgorithm string
 }
 
 // Driver contains information about the home directory and the list of active mounts that are created using this driver.
@@ -131,6 +136,7 @@ type Driver struct {
 	supportsDataOnly *bool
 	usingMetacopy    bool
 	usingComposefs   bool
+	usingEROFS       bool
 
 	stagingDirsLocksMutex sync.Mutex
 	// stagingDirsLocks access is not thread safe, it is required that callers take
@@ -353,7 +359,7 @@ func Init(home string, options graphdriver.Options) (graphdriver.Driver, error) 
 	}
 
 	if opts.mountProgram != "" {
-		if unshare.IsRootless() && isNetworkFileSystem(fsMagic) && opts.forceMask == nil {
+		if unshare.IsRootless() && isNetworkFileSystem(fsMagic) && opts.forceMask == nil && !opts.useEROFS {
 			m := os.FileMode(0o700)
 			opts.forceMask = &m
 			logrus.Warnf("Network file system detected as backing store.  Enforcing overlay option `force_mask=\"%o\"`.  Add it to storage.conf to silence this warning", m)
@@ -379,6 +385,17 @@ func Init(home string, options graphdriver.Options) (graphdriver.Driver, error) 
 		}
 		if _, err := getComposeFsHelper(); err != nil {
 			return nil, fmt.Errorf("composefs helper program not found: %w", err)
+		}
+	}
+
+	if opts.useEROFS {
+		if _, err := getEROFSHelper(); err != nil {
+			return nil, fmt.Errorf("EROFS helper program (mkfs.erofs) not found: %w", err)
+		}
+		if unshare.IsRootless() {
+			if _, err := getEROFSFuseHelper(); err != nil {
+				return nil, fmt.Errorf("EROFS FUSE helper program (erofsfuse) not found (required for rootless EROFS): %w", err)
+			}
 		}
 	}
 
@@ -442,6 +459,7 @@ func Init(home string, options graphdriver.Options) (graphdriver.Driver, error) 
 		usingMetacopy:         usingMetacopy,
 		supportsVolatile:      supportsVolatile,
 		usingComposefs:        opts.useComposefs,
+		usingEROFS:            opts.useEROFS,
 		options:               *opts,
 		stagingDirsLocksMutex: sync.Mutex{},
 		stagingDirsLocks:      make(map[string]*staging_lockfile.StagingLockFile),
@@ -557,6 +575,27 @@ func parseOptions(options []string) (*overlayOptions, error) {
 			if err != nil {
 				return nil, err
 			}
+		case "use_erofs":
+			logrus.Debugf("overlay: use_erofs=%s", val)
+			o.useEROFS, err = strconv.ParseBool(val)
+			if err != nil {
+				return nil, err
+			}
+		case "erofs_force_ids":
+			logrus.Debugf("overlay: erofs_force_ids=%s", val)
+			o.erofsForceIDs, err = strconv.ParseBool(val)
+			if err != nil {
+				return nil, err
+			}
+		case "erofs_force_uid":
+			logrus.Debugf("overlay: erofs_force_uid=%s", val)
+			o.erofsForceUID = val
+		case "erofs_force_gid":
+			logrus.Debugf("overlay: erofs_force_gid=%s", val)
+			o.erofsForceGID = val
+		case "erofs_compression_algorithm":
+			logrus.Debugf("overlay: erofs_compression_algorithm=%s", val)
+			o.erofsCompressionAlgorithm = val
 		case "mount_program":
 			logrus.Debugf("overlay: mount_program=%s", val)
 			if val != "" {
@@ -777,6 +816,9 @@ func supportsOverlay(home string, rootUID, rootGID int) (supportsDType bool, err
 
 func (d *Driver) useNaiveDiff() bool {
 	if d.usingComposefs {
+		return true
+	}
+	if d.usingEROFS {
 		return true
 	}
 
@@ -1336,6 +1378,28 @@ func (d *Driver) removeCommon(id string, cleanup func(string) error) error {
 
 	d.releaseAdditionalLayerByID(id)
 
+	// Clean up EROFS mount points and directories
+	erofsLayersBase := filepath.Join(d.runhome, id, "erofs-layers")
+	if err := fileutils.Exists(erofsLayersBase); err == nil {
+		dirs, err := os.ReadDir(erofsLayersBase)
+		if err == nil {
+			for _, entry := range dirs {
+				if entry.IsDir() {
+					mountPoint := filepath.Join(erofsLayersBase, entry.Name())
+					if err := unix.Unmount(mountPoint, unix.MNT_DETACH); err != nil && !errors.Is(err, unix.EINVAL) && !errors.Is(err, os.ErrNotExist) {
+						logrus.Warnf("Failed to unmount EROFS mount point %q during Remove: %v", mountPoint, err)
+					}
+					if err := os.RemoveAll(mountPoint); err != nil && !os.IsNotExist(err) {
+						logrus.Warnf("Failed to remove EROFS mount point directory %q during Remove: %v", mountPoint, err)
+					}
+				}
+			}
+		}
+		if err := os.RemoveAll(erofsLayersBase); err != nil && !os.IsNotExist(err) {
+			logrus.Warnf("Failed to remove EROFS layers base directory %q during Remove: %v", erofsLayersBase, err)
+		}
+	}
+
 	if err := cleanup(dir); err != nil && !os.IsNotExist(err) {
 		return err
 	}
@@ -1632,8 +1696,16 @@ func (d *Driver) get(id string, disableShifting bool, options graphdriver.MountO
 	skipIDMappingLayers := make(map[string]string)
 
 	composefsMounts := []string{}
+	erofsMounts := []string{}
 	defer func() {
 		for _, m := range composefsMounts {
+			defer func(m string) {
+				if err := unix.Unmount(m, unix.MNT_DETACH); err != nil {
+					logrus.Warnf("Unmount %q: %v", m, err)
+				}
+			}(m)
+		}
+		for _, m := range erofsMounts {
 			defer func(m string) {
 				if err := unix.Unmount(m, unix.MNT_DETACH); err != nil {
 					logrus.Warnf("Unmount %q: %v", m, err)
@@ -1675,9 +1747,51 @@ func (d *Driver) get(id string, disableShifting bool, options graphdriver.MountO
 		return dest, nil
 	}
 
+	// EROFS mount logic
+	maybeAddEROFSMount := func(lowerID string, i int, readWrite bool) (string, error) {
+		if !d.options.useEROFS {
+			return "", nil
+		}
+
+		diffDir, err := d.getDiffPath(lowerID)
+		if err != nil {
+			return "", err
+		}
+		erofsBlobPath := getEROFSBlob(diffDir)
+		if !erofsExists(diffDir) {
+			return "", nil
+		}
+
+		logrus.Debugf("overlay: using EROFS blob %s for layer %s", erofsBlobPath, lowerID)
+
+		if readWrite && i == 0 {
+			return "", fmt.Errorf("cannot mount an EROFS layer as writeable")
+		}
+
+		// Always use additional store so that the layers private directory is in the rundir
+		dest := d.getStorePrivateDirectory(id, dir, fmt.Sprintf("erofs-layers/%d", i), true)
+		if err := os.MkdirAll(dest, 0o700); err != nil {
+			return "", fmt.Errorf("failed to create EROFS mount directory: %w", err)
+		}
+
+		if err := mountEROFSBlob(erofsBlobPath, dest); err != nil {
+			return "", fmt.Errorf("failed to mount EROFS blob: %w", err)
+		}
+
+		erofsMounts = append(erofsMounts, dest)
+		skipIDMappingLayers[dest] = dest
+		return dest, nil
+	}
+
 	diffDir := path.Join(dir, "diff")
 
 	if dest, err := maybeAddComposefsMount(id, 0, readWrite); err != nil {
+		return "", err
+	} else if dest != "" {
+		diffDir = dest
+	}
+
+	if dest, err := maybeAddEROFSMount(id, 0, readWrite); err != nil {
 		return "", err
 	} else if dest != "" {
 		diffDir = dest
@@ -1748,6 +1862,32 @@ func (d *Driver) get(id string, disableShifting bool, options graphdriver.MountO
 				}()
 			}
 			absLowers = append(absLowers, composefsMount)
+			continue
+		}
+
+		erofsMount, err := maybeAddEROFSMount(lowerID, i+1, readWrite)
+		if err != nil {
+			return "", err
+		}
+		if erofsMount != "" {
+			// Skip ID mapping if EROFS force IDs are enabled since ownership is already
+			// handled at the EROFS filesystem level and FUSE doesn't support chown operations
+			if needsIDMapping && !d.options.erofsForceIDs {
+				if err := idmap.CreateIDMappedMount(erofsMount, erofsMount, idmappedMountProcessPid); err != nil {
+					return "", fmt.Errorf("create mapped mount for %q: %w", erofsMount, err)
+				}
+				skipIDMappingLayers[erofsMount] = erofsMount
+				// overlay takes a reference on the mount, so it is safe to unmount
+				// the mapped idmounts as soon as the final overlay file system is mounted.
+				defer func() {
+					if err := unix.Unmount(erofsMount, unix.MNT_DETACH); err != nil {
+						logrus.Warnf("Unmount %q: %v", erofsMount, err)
+					}
+				}()
+			} else if d.options.erofsForceIDs {
+				logrus.Debugf("EROFS: Skipping ID mapping for EROFS mount %s since force IDs are enabled", erofsMount)
+			}
+			absLowers = append(absLowers, erofsMount)
 			continue
 		}
 
@@ -2135,6 +2275,7 @@ func (d *Driver) getWhiteoutFormat() archive.WhiteoutFormat {
 type overlayFileGetter struct {
 	diffDirs        []string
 	composefsMounts map[string]*os.File // map from diff dir to the directory with the composefs blob mounted
+	erofsMounts     map[string]string   // map from diff dir to the directory with the EROFS blob mounted
 }
 
 func (g *overlayFileGetter) Get(path string) (io.ReadCloser, error) {
@@ -2154,6 +2295,16 @@ func (g *overlayFileGetter) Get(path string) (io.ReadCloser, error) {
 			return os.Open(filepath.Join(d, string(buf[:len])))
 		}
 
+		if mountPoint, found := g.erofsMounts[d]; found {
+			// EROFS layer found, read from mounted filesystem
+			f, err := os.Open(filepath.Join(mountPoint, path))
+			if err == nil {
+				return f, nil
+			}
+			// File not found in this EROFS mount, continue to next layer
+			continue
+		}
+
 		f, err := os.Open(filepath.Join(d, path))
 		if err == nil {
 			return f, nil
@@ -2171,6 +2322,11 @@ func (g *overlayFileGetter) Close() (errs error) {
 			errs = errors.Join(errs, err)
 		}
 		if err := unix.Rmdir(f.Name()); err != nil {
+			errs = errors.Join(errs, err)
+		}
+	}
+	for _, mountPoint := range g.erofsMounts {
+		if err := unmountEROFSBlob(mountPoint); err != nil {
 			errs = errors.Join(errs, err)
 		}
 	}
@@ -2202,12 +2358,19 @@ func (d *Driver) DiffGetter(id string) (_ graphdriver.FileGetCloser, Err error) 
 
 	// map from diff dir to the directory with the composefs blob mounted
 	composefsMounts := make(map[string]*os.File)
+	// map from diff dir to the directory with the EROFS blob mounted
+	erofsMounts := make(map[string]string)
 	defer func() {
 		if Err != nil {
 			for _, f := range composefsMounts {
 				f.Close()
 				if err := unix.Rmdir(f.Name()); err != nil && !os.IsNotExist(err) {
 					logrus.Warnf("Failed to remove %s: %v", f.Name(), err)
+				}
+			}
+			for _, mountPoint := range erofsMounts {
+				if err := unmountEROFSBlob(mountPoint); err != nil {
+					logrus.Warnf("Failed to unmount EROFS %s: %v", mountPoint, err)
 				}
 			}
 		}
@@ -2217,17 +2380,29 @@ func (d *Driver) DiffGetter(id string) (_ graphdriver.FileGetCloser, Err error) 
 		// diffDir has the form $GRAPH_ROOT/overlay/$ID/diff, so grab the $ID from the parent directory
 		id := path.Base(path.Dir(diffDir))
 		composefsData := d.getComposefsData(id)
-		if fileutils.Exists(composefsData) != nil {
-			// not a composefs layer, ignore it
+		if fileutils.Exists(composefsData) == nil {
+			// composefs layer found
+			fd, err := openComposefsMount(composefsData)
+			if err != nil {
+				return nil, err
+			}
+			composefsMounts[diffDir] = os.NewFile(uintptr(fd), composefsData)
 			continue
 		}
-		fd, err := openComposefsMount(composefsData)
-		if err != nil {
-			return nil, err
+
+		// Check for EROFS blob
+		layerDir := d.dir(id)
+		erofsBlobPath := getEROFSBlob(diffDir)
+		if erofsExists(diffDir) {
+			// EROFS layer found, mount it for reading
+			mountPoint := filepath.Join(layerDir, "erofs-reader")
+			if err := mountEROFSBlob(erofsBlobPath, mountPoint); err != nil {
+				return nil, fmt.Errorf("failed to mount EROFS blob for reading: %w", err)
+			}
+			erofsMounts[diffDir] = mountPoint
 		}
-		composefsMounts[diffDir] = os.NewFile(uintptr(fd), composefsData)
 	}
-	return &overlayFileGetter{diffDirs: diffDirs, composefsMounts: composefsMounts}, nil
+	return &overlayFileGetter{diffDirs: diffDirs, composefsMounts: composefsMounts, erofsMounts: erofsMounts}, nil
 }
 
 // CleanupStagingDirectory cleanups the staging directory.
@@ -2474,6 +2649,28 @@ func (d *Driver) applyDiff(target string, options graphdriver.ApplyDiffOpts) (si
 	idMappings := options.Mappings
 	if idMappings == nil {
 		idMappings = &idtools.IDMappings{}
+	}
+
+	// If EROFS is enabled, generate EROFS blob directly from tar stream
+	if d.options.useEROFS {
+		erofsBlobPath := getEROFSBlob(target)
+
+		logrus.Debugf("Generating EROFS blob directly from tar stream to %s", erofsBlobPath)
+		if err := generateEROFSBlobFromTar(options.Diff, target, &d.options); err != nil {
+			return 0, fmt.Errorf("failed to generate EROFS blob: %w", err)
+		}
+
+		// Create empty diff directory as placeholder (required by overlay driver)
+		if err := os.MkdirAll(target, 0755); err != nil {
+			return 0, fmt.Errorf("failed to create placeholder diff directory: %w", err)
+		}
+
+		// Return the size of the EROFS blob
+		if stat, err := os.Stat(erofsBlobPath); err != nil {
+			return 0, fmt.Errorf("failed to stat EROFS blob: %w", err)
+		} else {
+			return stat.Size(), nil
+		}
 	}
 
 	logrus.Debugf("Applying tar in %s", target)

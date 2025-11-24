@@ -157,6 +157,49 @@ func TestOverlayOptions(t *testing.T) {
 		t.Fatalf("Expected to find 'use_composefs' options, got %v", doptions)
 	}
 
+	options.Overlay.UseEROFS = "true"
+	doptions = GetGraphDriverOptions("overlay", options)
+	if len(doptions) == 0 {
+		t.Fatalf("Expected > 0 options, got %v", doptions)
+	}
+	if !searchOptions(doptions, "use_erofs") {
+		t.Fatalf("Expected to find 'use_erofs' options, got %v", doptions)
+	}
+
+	// Test use_erofs false
+	options.Overlay.UseEROFS = "false"
+	doptions = GetGraphDriverOptions("overlay", options)
+	if len(doptions) == 0 {
+		t.Fatalf("Expected > 0 options, got %v", doptions)
+	}
+	if !searchOptions(doptions, "use_erofs=false") {
+		t.Fatalf("Expected to find 'use_erofs=false' options, got %v", doptions)
+	}
+
+	// Test erofs_force_ids true
+	options.Overlay.EROFSForceIDs = "true"
+	doptions = GetGraphDriverOptions("overlay", options)
+	if len(doptions) == 0 {
+		t.Fatalf("Expected > 0 options, got %v", doptions)
+	}
+	if !searchOptions(doptions, "erofs_force_ids=true") {
+		t.Fatalf("Expected to find 'erofs_force_ids=true' options, got %v", doptions)
+	}
+
+	// Test erofs_force_uid and erofs_force_gid
+	options.Overlay.EROFSForceUID = "1000"
+	options.Overlay.EROFSForceGID = "1000"
+	doptions = GetGraphDriverOptions("overlay", options)
+	if len(doptions) == 0 {
+		t.Fatalf("Expected > 0 options, got %v", doptions)
+	}
+	if !searchOptions(doptions, "erofs_force_uid=1000") {
+		t.Fatalf("Expected to find 'erofs_force_uid=1000' options, got %v", doptions)
+	}
+	if !searchOptions(doptions, "erofs_force_gid=1000") {
+		t.Fatalf("Expected to find 'erofs_force_gid=1000' options, got %v", doptions)
+	}
+
 	// Make sure legacy mountopt still works
 	options = OptionsConfig{}
 	options.SkipMountHome = "true"

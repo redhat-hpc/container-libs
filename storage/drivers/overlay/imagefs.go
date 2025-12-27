@@ -51,6 +51,67 @@ func (d *Driver) maybeAddImageFSMount(id, dir, lowerID string, i int, readWrite,
 	return dest, nil
 }
 
+// unmountImageFSMounts unmounts all imagefs mounts for a given id.
+// It handles both rootful (unix.Unmount) and rootless/FUSE (fusermount) unmounts.
+func (d *Driver) unmountImageFSMounts(id string) error {
+	if d.options.imageFSType == "" {
+		return nil
+	}
+
+	imagefsLayersDir := path.Join(d.runhome, id, "imagefs-layers")
+	if err := fileutils.Exists(imagefsLayersDir); err != nil {
+		if os.IsNotExist(err) {
+			return nil // No imagefs mounts to unmount
+		}
+		return err
+	}
+
+	entries, err := os.ReadDir(imagefsLayersDir)
+	if err != nil {
+		return fmt.Errorf("reading imagefs-layers directory: %w", err)
+	}
+
+	var unmountErrors []error
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		mountpoint := path.Join(imagefsLayersDir, entry.Name())
+		logrus.Debugf("overlay: unmounting imagefs mount at %q", mountpoint)
+
+		unmounted := false
+		// Try FUSE unmount first (for rootless or FUSE mounts)
+		if unshare.IsRootless() || d.options.imageFSMountProgram != "" {
+			for _, v := range []string{"fusermount3", "fusermount"} {
+				err := exec.Command(v, "-u", mountpoint).Run()
+				if err != nil && !errors.Is(err, exec.ErrNotFound) {
+					logrus.Errorf("Error unmounting %s with %s - %v", mountpoint, v, err)
+				}
+				if err == nil {
+					unmounted = true
+					break
+				}
+			}
+		}
+
+		// Fallback to regular unmount (for rootful or if FUSE unmount failed)
+		if !unmounted {
+			if err := unix.Unmount(mountpoint, unix.MNT_DETACH); err != nil {
+				if !errors.Is(err, unix.EINVAL) && !os.IsNotExist(err) {
+					unmountErrors = append(unmountErrors, fmt.Errorf("unmounting %q: %w", mountpoint, err))
+					logrus.Errorf("Failed to unmount imagefs mount %s: %v", mountpoint, err)
+				}
+			}
+		}
+	}
+
+	if len(unmountErrors) > 0 {
+		return fmt.Errorf("errors unmounting imagefs mounts: %w", errors.Join(unmountErrors...))
+	}
+
+	return nil
+}
+
 func (d *Driver) getImageFSData(id string) string {
 	dir := d.dir(id)
 	// Use a generic name based on the filesystem type, or default to "image.img"

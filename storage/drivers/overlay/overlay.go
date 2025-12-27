@@ -1352,6 +1352,12 @@ func (d *Driver) removeCommon(id string, cleanup func(string) error) error {
 		}
 	}
 
+	// Unmount any imagefs mounts for this layer before removing it
+	if err := d.unmountImageFSMounts(id); err != nil {
+		logrus.Debugf("Failed to unmount imagefs mounts for %s: %v", id, err)
+		// Don't fail Remove if imagefs unmount fails, but log it
+	}
+
 	d.releaseAdditionalLayerByID(id)
 
 	if err := cleanup(dir); err != nil && !os.IsNotExist(err) {
@@ -2114,6 +2120,12 @@ func (d *Driver) Put(id string) error {
 				return fmt.Errorf("unmounting %q: %w", mountpoint, err)
 			}
 		}
+	}
+
+	// Unmount any imagefs mounts for this layer
+	if err := d.unmountImageFSMounts(id); err != nil {
+		logrus.Debugf("Failed to unmount imagefs mounts for %s: %v", id, err)
+		// Don't fail Put if imagefs unmount fails, but log it
 	}
 
 	if inAdditionalStore {

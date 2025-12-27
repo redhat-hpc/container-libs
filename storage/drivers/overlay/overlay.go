@@ -2425,9 +2425,7 @@ func (d *Driver) ApplyDiffWithDiffer(options *graphdriver.ApplyDiffWithDifferOpt
 
 // ApplyDiffFromStagingDirectory applies the changes using the specified staging directory.
 func (d *Driver) ApplyDiffFromStagingDirectory(id, parent string, diffOutput *graphdriver.DriverWithDifferOutput, options *graphdriver.ApplyDiffWithDifferOpts) (errRet error) {
-	logrus.Debugf("overlay: ApplyDiffFromStagingDirectory called for id=%q, parent=%q", id, parent)
 	stagingDirectory := diffOutput.Target
-	logrus.Debugf("overlay: ApplyDiffFromStagingDirectory: stagingDirectory=%q", stagingDirectory)
 	parentStagingDir := filepath.Dir(stagingDirectory)
 
 	defer func() {
@@ -2551,7 +2549,6 @@ func (d *Driver) StartStagingDiffToApply(parent string, options graphdriver.Appl
 //
 // This API is experimental and can be changed without bumping the major version number.
 func (d *Driver) CommitStagedLayer(id string, sa *tempdir.StagedAddition) error {
-	logrus.Debugf("overlay: CommitStagedLayer called for id=%q, stagingPath=%q", id, sa.Path)
 	applyDir, err := d.getDiffPath(id)
 	if err != nil {
 		return err

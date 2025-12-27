@@ -68,7 +68,7 @@ func (d *Driver) mountImageFSBlob(imageBlob, dest, fsType string) error {
 		// Try to find a FUSE mount program for this filesystem type
 		// Common ones: fuse2fs (ext2/3/4), fuse.erofs, squashfuse (squashfs)
 		fusePrograms := map[string]string{
-			"erofs":    "fuse.erofs",
+			"erofs":    "erofsfuse",
 			"squashfs": "squashfuse",
 			"ext2":     "fuse2fs",
 			"ext3":     "fuse2fs",

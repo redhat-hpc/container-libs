@@ -464,6 +464,11 @@ func Init(home string, options graphdriver.Options) (graphdriver.Driver, error) 
 
 	logrus.Debugf("backingFs=%s, projectQuotaSupported=%v, useNativeDiff=%v, usingMetacopy=%v", backingFs, projectQuotaSupported, !d.useNaiveDiff(), d.usingMetacopy)
 
+	// Validate imagefs configuration and check for required tools
+	if err := validateImageFSConfig(opts); err != nil {
+		return nil, err
+	}
+
 	return d, nil
 }
 

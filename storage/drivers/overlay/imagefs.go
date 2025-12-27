@@ -19,6 +19,34 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// validateImageFSConfig validates imagefs configuration and checks for required tools.
+func validateImageFSConfig(opts *overlayOptions) error {
+	if opts.imageFSType == "" {
+		return nil
+	}
+
+	// If create command is not specified, check if default tool exists
+	if opts.imageFSCreateCommand == "" {
+		var toolName string
+		switch opts.imageFSType {
+		case "erofs":
+			toolName = "mkfs.erofs"
+		case "squashfs":
+			toolName = "mksquashfs"
+		default:
+			return fmt.Errorf("image_fs_type %q requires an image_fs_create_command to be set", opts.imageFSType)
+		}
+
+		// Check if the default tool exists
+		if _, err := exec.LookPath(toolName); err != nil {
+			return fmt.Errorf("image_fs_type %q requires %s to be available (or set image_fs_create_command)", opts.imageFSType, toolName)
+		}
+		logrus.Debugf("overlay: validated default tool %q for image_fs_type %q", toolName, opts.imageFSType)
+	}
+
+	return nil
+}
+
 func (d *Driver) maybeAddImageFSMount(id, dir, lowerID string, i int, readWrite, inAdditionalStore bool) (string, error) {
 	logrus.Debugf("overlay: maybeAddImageFSMount called for id=%q, dir=%q, lowerID=%q, i=%d, readWrite=%v", id, dir, lowerID, i, readWrite)
 	if d.options.imageFSType == "" {

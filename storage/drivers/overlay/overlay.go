@@ -18,7 +18,6 @@ import (
 	"strings"
 	"sync"
 	"syscall"
-	"text/template"
 
 	units "github.com/docker/go-units"
 	digest "github.com/opencontainers/go-digest"
@@ -2464,60 +2463,8 @@ func (d *Driver) ApplyDiffFromStagingDirectory(id, parent string, diffOutput *gr
 
 	// Handle image filesystem creation from staging directory
 	if d.options.imageFSType != "" {
-		logrus.Debugf("overlay: ApplyDiffFromStagingDirectory: imageFSType=%q, creating imagefs", d.options.imageFSType)
-		imagePath := d.getImageFSData(id)
-		imageDir := path.Dir(imagePath)
-		logrus.Debugf("overlay: ApplyDiffFromStagingDirectory: imagePath=%q, imageDir=%q", imagePath, imageDir)
-
-		if d.options.imageFSCreateCommand == "" {
-			return fmt.Errorf("image_fs_type %q requires an image_fs_create_command to be set", d.options.imageFSType)
-		}
-
-		// Ensure the directory for the image file exists
-		if err := os.MkdirAll(imageDir, 0o755); err != nil {
-			return fmt.Errorf("creating directory for image file: %w", err)
-		}
-
-		// Create the image file from the staging directory contents
-		logrus.Debugf("overlay: ApplyDiffFromStagingDirectory: creating image file at %q from staging directory %q", imagePath, stagingDirectory)
-		// Construct and execute the image creation command using template expansion
-		tmpl, err := template.New("image_fs_create_command").Parse(d.options.imageFSCreateCommand)
-		if err != nil {
-			return fmt.Errorf("parsing image_fs_create_command template: %w", err)
-		}
-
-		var cmdBuf bytes.Buffer
-		templateData := struct {
-			ImagePath string
-			TmpDir    string
-		}{
-			ImagePath: imagePath,
-			TmpDir:    stagingDirectory,
-		}
-		if err = tmpl.Execute(&cmdBuf, templateData); err != nil {
-			return fmt.Errorf("executing image_fs_create_command template: %w", err)
-		}
-
-		// Parse the expanded command into arguments
-		expandedCmd := strings.TrimSpace(cmdBuf.String())
-		args := strings.Fields(expandedCmd)
-		if len(args) == 0 {
-			return fmt.Errorf("invalid image_fs_create_command: template expanded to empty command")
-		}
-		cmd := exec.Command(args[0], args[1:]...)
-		var stderrBuf bytes.Buffer
-		cmd.Stderr = &stderrBuf
-
-		if err = cmd.Run(); err != nil {
-			return fmt.Errorf("executing image create command %q: %s %w", expandedCmd, stderrBuf.String(), err)
-		}
-
-		logrus.Debugf("overlay: ApplyDiffFromStagingDirectory: successfully created image file at %q", imagePath)
-		// Verify the image file was created
-		if stat, err := os.Stat(imagePath); err != nil {
-			return fmt.Errorf("image file was not created at %q: %w", imagePath, err)
-		} else {
-			logrus.Debugf("overlay: ApplyDiffFromStagingDirectory: verified image file exists, size=%d", stat.Size())
+		if err := d.createImageFSFromDirectory(id, stagingDirectory, "ApplyDiffFromStagingDirectory"); err != nil {
+			return err
 		}
 
 		// Remove the staging directory since we've created the image file
@@ -2604,60 +2551,8 @@ func (d *Driver) CommitStagedLayer(id string, sa *tempdir.StagedAddition) error 
 
 	// Handle image filesystem creation from staging directory
 	if d.options.imageFSType != "" {
-		logrus.Debugf("overlay: CommitStagedLayer: imageFSType=%q, creating imagefs", d.options.imageFSType)
-		imagePath := d.getImageFSData(id)
-		imageDir := path.Dir(imagePath)
-		logrus.Debugf("overlay: CommitStagedLayer: imagePath=%q, imageDir=%q", imagePath, imageDir)
-
-		if d.options.imageFSCreateCommand == "" {
-			return fmt.Errorf("image_fs_type %q requires an image_fs_create_command to be set", d.options.imageFSType)
-		}
-
-		// Ensure the directory for the image file exists
-		if err := os.MkdirAll(imageDir, 0o755); err != nil {
-			return fmt.Errorf("creating directory for image file: %w", err)
-		}
-
-		// Create the image file from the staging directory contents
-		logrus.Debugf("overlay: CommitStagedLayer: creating image file at %q from staging directory %q", imagePath, sa.Path)
-		// Construct and execute the image creation command using template expansion
-		tmpl, err := template.New("image_fs_create_command").Parse(d.options.imageFSCreateCommand)
-		if err != nil {
-			return fmt.Errorf("parsing image_fs_create_command template: %w", err)
-		}
-
-		var cmdBuf bytes.Buffer
-		templateData := struct {
-			ImagePath string
-			TmpDir    string
-		}{
-			ImagePath: imagePath,
-			TmpDir:    sa.Path,
-		}
-		if err = tmpl.Execute(&cmdBuf, templateData); err != nil {
-			return fmt.Errorf("executing image_fs_create_command template: %w", err)
-		}
-
-		// Parse the expanded command into arguments
-		expandedCmd := strings.TrimSpace(cmdBuf.String())
-		args := strings.Fields(expandedCmd)
-		if len(args) == 0 {
-			return fmt.Errorf("invalid image_fs_create_command: template expanded to empty command")
-		}
-		cmd := exec.Command(args[0], args[1:]...)
-		var stderrBuf bytes.Buffer
-		cmd.Stderr = &stderrBuf
-
-		if err = cmd.Run(); err != nil {
-			return fmt.Errorf("executing image create command %q: %s %w", expandedCmd, stderrBuf.String(), err)
-		}
-
-		logrus.Debugf("overlay: CommitStagedLayer: successfully created image file at %q", imagePath)
-		// Verify the image file was created
-		if stat, err := os.Stat(imagePath); err != nil {
-			return fmt.Errorf("image file was not created at %q: %w", imagePath, err)
-		} else {
-			logrus.Debugf("overlay: CommitStagedLayer: verified image file exists, size=%d", stat.Size())
+		if err := d.createImageFSFromDirectory(id, sa.Path, "CommitStagedLayer"); err != nil {
+			return err
 		}
 
 		// Remove the staging directory since we've created the image file
@@ -2716,20 +2611,9 @@ func (d *Driver) applyDiff(target string, options graphdriver.ApplyDiffOpts) (si
 		}
 
 		if !skipImageFSCreation {
-			if d.options.imageFSCreateCommand == "" {
-				return 0, fmt.Errorf("image_fs_type %q requires an image_fs_create_command to be set", d.options.imageFSType)
-			}
-
 			// Use the standard location based on the target directory
 			layerDir := path.Dir(target)
-			imagePath := d.getImageFSData(path.Base(layerDir))
-			logrus.Debugf("overlay: creating image file in layer directory: %q", imagePath)
-
-			// Ensure the directory for the image file exists before creating it
-			imageDir := path.Dir(imagePath)
-			if err := os.MkdirAll(imageDir, 0o755); err != nil {
-				return 0, fmt.Errorf("creating directory for image file %q: %w", imagePath, err)
-			}
+			layerID := path.Base(layerDir)
 
 			// Create a temporary directory to untar the diff into, which the image creation tool needs as a source
 			tmpDir, err := os.MkdirTemp(d.home, fmt.Sprintf("%s-apply-diff-", d.options.imageFSType))
@@ -2753,45 +2637,17 @@ func (d *Driver) applyDiff(target string, options graphdriver.ApplyDiffOpts) (si
 				return 0, fmt.Errorf("untarring diff to temporary directory for %s: %w", d.options.imageFSType, err)
 			}
 
-			// Construct and execute the image creation command using template expansion
-			// The template supports variables: {{.ImagePath}} and {{.TmpDir}}
-			tmpl, err := template.New("image_fs_create_command").Parse(d.options.imageFSCreateCommand)
-			if err != nil {
-				return 0, fmt.Errorf("parsing image_fs_create_command template: %w", err)
-			}
-
-			var cmdBuf bytes.Buffer
-			templateData := struct {
-				ImagePath string
-				TmpDir    string
-			}{
-				ImagePath: imagePath,
-				TmpDir:    tmpDir,
-			}
-			if err = tmpl.Execute(&cmdBuf, templateData); err != nil {
-				return 0, fmt.Errorf("executing image_fs_create_command template: %w", err)
-			}
-
-			// Parse the expanded command into arguments
-			expandedCmd := strings.TrimSpace(cmdBuf.String())
-			args := strings.Fields(expandedCmd)
-			if len(args) == 0 {
-				return 0, fmt.Errorf("invalid image_fs_create_command: template expanded to empty command")
-			}
-			cmd := exec.Command(args[0], args[1:]...)
-			var stderrBuf bytes.Buffer
-			cmd.Stderr = &stderrBuf
-
-			if err = cmd.Run(); err != nil {
-				return 0, fmt.Errorf("executing image create command %q: %s %w", expandedCmd, stderrBuf.String(), err)
+			// Create the image filesystem from the temporary directory
+			if err := d.createImageFSFromDirectory(layerID, tmpDir, "applyDiff"); err != nil {
+				return 0, err
 			}
 
 			// Return the size of the created image
+			imagePath := d.getImageFSData(layerID)
 			stat, err := os.Stat(imagePath)
 			if err != nil {
 				return 0, fmt.Errorf("getting size of %s image %q: %w", d.options.imageFSType, imagePath, err)
 			}
-			logrus.Debugf("overlay: applyDiff: successfully created image file at %q, size: %d", imagePath, stat.Size())
 			return stat.Size(), nil
 		}
 	}

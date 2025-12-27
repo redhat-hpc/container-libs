@@ -3,12 +3,14 @@
 package overlay
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path"
 	"strings"
+	"text/template"
 
 	"github.com/sirupsen/logrus"
 	"go.podman.io/storage/pkg/fileutils"
@@ -56,6 +58,68 @@ func (d *Driver) getImageFSData(id string) string {
 		imageName = "image.img"
 	}
 	return path.Join(dir, imageName)
+}
+
+// createImageFSFromDirectory creates an image filesystem from the contents of a source directory.
+// It uses the image_fs_create_command template with ImagePath and TmpDir variables.
+func (d *Driver) createImageFSFromDirectory(layerID, sourceDir, context string) error {
+	if d.options.imageFSType == "" {
+		return nil
+	}
+
+	if d.options.imageFSCreateCommand == "" {
+		return fmt.Errorf("image_fs_type %q requires an image_fs_create_command to be set", d.options.imageFSType)
+	}
+
+	imagePath := d.getImageFSData(layerID)
+	imageDir := path.Dir(imagePath)
+	logrus.Debugf("overlay: %s: creating imagefs, imagePath=%q, imageDir=%q, sourceDir=%q", context, imagePath, imageDir, sourceDir)
+
+	// Ensure the directory for the image file exists
+	if err := os.MkdirAll(imageDir, 0o755); err != nil {
+		return fmt.Errorf("creating directory for image file: %w", err)
+	}
+
+	// Construct and execute the image creation command using template expansion
+	tmpl, err := template.New("image_fs_create_command").Parse(d.options.imageFSCreateCommand)
+	if err != nil {
+		return fmt.Errorf("parsing image_fs_create_command template: %w", err)
+	}
+
+	var cmdBuf bytes.Buffer
+	templateData := struct {
+		ImagePath string
+		TmpDir    string
+	}{
+		ImagePath: imagePath,
+		TmpDir:    sourceDir,
+	}
+	if err = tmpl.Execute(&cmdBuf, templateData); err != nil {
+		return fmt.Errorf("executing image_fs_create_command template: %w", err)
+	}
+
+	// Parse the expanded command into arguments
+	expandedCmd := strings.TrimSpace(cmdBuf.String())
+	args := strings.Fields(expandedCmd)
+	if len(args) == 0 {
+		return fmt.Errorf("invalid image_fs_create_command: template expanded to empty command")
+	}
+	cmd := exec.Command(args[0], args[1:]...)
+	var stderrBuf bytes.Buffer
+	cmd.Stderr = &stderrBuf
+
+	if err = cmd.Run(); err != nil {
+		return fmt.Errorf("executing image create command %q: %s %w", expandedCmd, stderrBuf.String(), err)
+	}
+
+	logrus.Debugf("overlay: %s: successfully created image file at %q", context, imagePath)
+	// Verify the image file was created
+	stat, err := os.Stat(imagePath)
+	if err != nil {
+		return fmt.Errorf("image file was not created at %q: %w", imagePath, err)
+	}
+	logrus.Debugf("overlay: %s: verified image file exists, size=%d", context, stat.Size())
+	return nil
 }
 
 func (d *Driver) mountImageFSBlob(imageBlob, dest, fsType string) error {

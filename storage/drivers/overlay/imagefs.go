@@ -123,13 +123,17 @@ func (d *Driver) createImageFSFromDirectory(layerID, sourceDir, context string) 
 		return nil
 	}
 
-	// Use default command if not specified (only for erofs)
+	// Use default command if not specified (for erofs and squashfs)
 	createCommand := d.options.imageFSCreateCommand
 	if createCommand == "" {
-		if d.options.imageFSType == "erofs" {
+		switch d.options.imageFSType {
+		case "erofs":
 			createCommand = "mkfs.erofs -z lz4 {{.ImagePath}} {{.TmpDir}}"
 			logrus.Debugf("overlay: %s: using default imagefs create command for erofs: %q", context, createCommand)
-		} else {
+		case "squashfs":
+			createCommand = "mksquashfs {{.TmpDir}} {{.ImagePath}}"
+			logrus.Debugf("overlay: %s: using default imagefs create command for squashfs: %q", context, createCommand)
+		default:
 			return fmt.Errorf("image_fs_type %q requires an image_fs_create_command to be set", d.options.imageFSType)
 		}
 	}

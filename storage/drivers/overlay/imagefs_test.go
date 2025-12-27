@@ -176,21 +176,11 @@ func TestImageFSMountWithParent(t *testing.T) {
 }
 
 func TestImageFSMountProgram(t *testing.T) {
-	// Test that image_fs_mount_program option validation works
-	// The option should be validated during driver initialization
-	// We expect an error if the mount program path doesn't exist
-	_, err := graphdriver.GetDriver(driverName, graphdriver.Options{
-		DriverOptions: []string{
-			`image_fs_type=erofs`,
-			`image_fs_create_command=mkfs.erofs {{.ImagePath}} {{.TmpDir}}`,
-			`image_fs_mount_program=/nonexistent/mount/program`,
-		},
-		Root:    t.TempDir(),
-		RunRoot: t.TempDir(),
-	})
-	// We expect an error because the mount program doesn't exist
-	require.Error(t, err, "should fail when mount program path doesn't exist")
-	assert.Contains(t, err.Error(), "image_fs_mount_program", "error should mention the mount program option")
+	// Test that imagefs configuration works without mount_program option
+	// (mount program is auto-detected based on filesystem type)
+	driver := graphtest.GetDriver(t, driverName, `image_fs_type=erofs`, `image_fs_create_command=mkfs.erofs {{.ImagePath}} {{.TmpDir}}`)
+	require.NotNil(t, driver)
+	// Driver should be created successfully - mount program will be auto-detected when needed
 }
 
 func TestImageFSMultipleLayers(t *testing.T) {

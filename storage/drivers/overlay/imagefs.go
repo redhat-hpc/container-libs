@@ -80,18 +80,9 @@ func (d *Driver) unmountImageFSMounts(id string) error {
 		logrus.Debugf("overlay: unmounting imagefs mount at %q", mountpoint)
 
 		unmounted := false
-		// Try FUSE unmount first (for rootless or FUSE mounts)
-		if unshare.IsRootless() || d.options.imageFSMountProgram != "" {
-			for _, v := range []string{"fusermount3", "fusermount"} {
-				err := exec.Command(v, "-u", mountpoint).Run()
-				if err != nil && !errors.Is(err, exec.ErrNotFound) {
-					logrus.Errorf("Error unmounting %s with %s - %v", mountpoint, v, err)
-				}
-				if err == nil {
-					unmounted = true
-					break
-				}
-			}
+		// Try FUSE unmount first (for rootless mounts)
+		if unshare.IsRootless() {
+			unmounted = tryFUSEUnmount(mountpoint)
 		}
 
 		// Fallback to regular unmount (for rootful or if FUSE unmount failed)
@@ -186,13 +177,10 @@ func (d *Driver) createImageFSFromDirectory(layerID, sourceDir, context string) 
 
 func (d *Driver) mountImageFSBlob(imageBlob, dest, fsType string) error {
 	logrus.Debugf("overlay: mounting %s image blob %q to %q", fsType, imageBlob, dest)
-	// If rootless and we have a mount program configured, use it
+	// If rootless, try to find a FUSE mount program for this filesystem type
 	if unshare.IsRootless() {
-		if d.options.imageFSMountProgram != "" {
-			return d.mountImageFSWithProgram(imageBlob, dest, fsType, d.options.imageFSMountProgram)
-		}
 		// Try to find a FUSE mount program for this filesystem type
-		// Common ones: fuse2fs (ext2/3/4), fuse.erofs, squashfuse (squashfs)
+		// Common ones: fuse2fs (ext2/3/4), erofsfuse, squashfuse (squashfs)
 		fusePrograms := map[string]string{
 			"erofs":    "erofsfuse",
 			"squashfs": "squashfuse",
@@ -230,7 +218,7 @@ func (d *Driver) mountImageFSBlob(imageBlob, dest, fsType string) error {
 
 	// Fall back to loop device + mount (rootful only, or if new API fails)
 	if unshare.IsRootless() {
-		return fmt.Errorf("rootless mount of %s requires image_fs_mount_program to be set or a FUSE mount program available", fsType)
+		return fmt.Errorf("rootless mount of %s requires a FUSE mount program (e.g., erofsfuse, squashfuse) to be available", fsType)
 	}
 	return d.mountImageFSWithLoop(imageBlob, dest, fsType)
 }

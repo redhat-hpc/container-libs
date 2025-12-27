@@ -116,7 +116,6 @@ type overlayOptions struct {
 	useComposefs         bool
 	imageFSType          string
 	imageFSCreateCommand string
-	imageFSMountProgram  string
 }
 
 // Driver contains information about the home directory and the list of active mounts that are created using this driver.
@@ -603,15 +602,6 @@ func parseOptions(options []string) (*overlayOptions, error) {
 		case "image_fs_create_command":
 			logrus.Debugf("overlay: image_fs_create_command=%s", val)
 			o.imageFSCreateCommand = val
-		case "image_fs_mount_program":
-			logrus.Debugf("overlay: image_fs_mount_program=%s", val)
-			if val != "" {
-				err := fileutils.Exists(val)
-				if err != nil {
-					return nil, fmt.Errorf("overlay: can't stat image_fs_mount_program %q: %w", val, err)
-				}
-			}
-			o.imageFSMountProgram = val
 		default:
 			return nil, fmt.Errorf("overlay: unknown option %s", key)
 		}
@@ -2058,6 +2048,21 @@ func (d *Driver) getMergedDir(id, dir string, inAdditionalStore bool) string {
 	return d.getStorePrivateDirectory(id, dir, "merged", inAdditionalStore)
 }
 
+// tryFUSEUnmount attempts to unmount a mountpoint using fusermount or fusermount3.
+// Returns true if unmount was successful, false otherwise.
+func tryFUSEUnmount(mountpoint string) bool {
+	for _, v := range []string{"fusermount3", "fusermount"} {
+		err := exec.Command(v, "-u", mountpoint).Run()
+		if err != nil && !errors.Is(err, exec.ErrNotFound) {
+			logrus.Debugf("Error unmounting %s with %s - %v", mountpoint, v, err)
+		}
+		if err == nil {
+			return true
+		}
+	}
+	return false
+}
+
 // Put unmounts the mount path created for the give id.
 func (d *Driver) Put(id string) error {
 	dir, _, inAdditionalStore := d.dir2(id, false)
@@ -2090,16 +2095,7 @@ func (d *Driver) Put(id string) error {
 	if d.options.mountProgram != "" {
 		// Attempt to unmount the FUSE mount using either fusermount or fusermount3.
 		// If they fail, fallback to unix.Unmount
-		for _, v := range []string{"fusermount3", "fusermount"} {
-			err := exec.Command(v, "-u", mountpoint).Run()
-			if err != nil && !errors.Is(err, exec.ErrNotFound) {
-				logrus.Debugf("Error unmounting %s with %s - %v", mountpoint, v, err)
-			}
-			if err == nil {
-				unmounted = true
-				break
-			}
-		}
+		unmounted = tryFUSEUnmount(mountpoint)
 		// If fusermount|fusermount3 failed to unmount the FUSE file system, make sure all
 		// pending changes are propagated to the file system
 		if !unmounted {

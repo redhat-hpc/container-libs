@@ -100,6 +100,9 @@ func (d *Driver) unmountImageFSMounts(id string) error {
 		return fmt.Errorf("errors unmounting imagefs mounts: %w", errors.Join(unmountErrors...))
 	}
 
+	// Clean up the imagefs-layers directory after unmounting
+	d.cleanupImageFSMounts(id)
+
 	return nil
 }
 
@@ -221,6 +224,18 @@ func (d *Driver) mountImageFSBlob(imageBlob, dest, fsType string) error {
 		return fmt.Errorf("rootless mount of %s requires a FUSE mount program (e.g., erofsfuse, squashfuse) to be available", fsType)
 	}
 	return d.mountImageFSWithLoop(imageBlob, dest, fsType)
+}
+
+// cleanupImageFSMounts removes the imagefs-layers directory from rundir after unmounting.
+func (d *Driver) cleanupImageFSMounts(id string) {
+	if d.options.imageFSType == "" {
+		return
+	}
+
+	imagefsLayersDir := path.Join(d.runhome, id, "imagefs-layers")
+	if err := os.RemoveAll(imagefsLayersDir); err != nil && !os.IsNotExist(err) {
+		logrus.Debugf("Failed to remove imagefs-layers directory %q: %v", imagefsLayersDir, err)
+	}
 }
 
 func (d *Driver) mountImageFSWithProgram(imageBlob, dest, fsType, mountProg string) error {

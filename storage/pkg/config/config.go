@@ -31,6 +31,10 @@ type OverlayOptionsConfig struct {
 	// ForceMask indicates the permissions mask (e.g. "0755") to use for new
 	// files and directories
 	ForceMask string `toml:"force_mask,omitempty"`
+	// ImageFSType specifies the type of filesystem to use for the layer
+	ImageFSType string `toml:"image_fs_type,omitempty"`
+	// ImageFSCreateCommand specifies the command to create the filesystem
+	ImageFSCreateCommand string `toml:"image_fs_create_command,omitempty"`
 }
 
 type VfsOptionsConfig struct {
@@ -176,6 +180,12 @@ func GetGraphDriverOptions(driverName string, options OptionsConfig) []string {
 		}
 		if options.Overlay.UseComposefs != "" {
 			doptions = append(doptions, fmt.Sprintf("%s.use_composefs=%s", driverName, options.Overlay.UseComposefs))
+		}
+		if options.Overlay.ImageFSType != "" {
+			doptions = append(doptions, fmt.Sprintf("%s.image_fs_type=%s", driverName, options.Overlay.ImageFSType))
+		}
+		if options.Overlay.ImageFSCreateCommand != "" {
+			doptions = append(doptions, fmt.Sprintf("%s.image_fs_create_command=%s", driverName, options.Overlay.ImageFSCreateCommand))
 		}
 	case "vfs":
 		if options.Vfs.IgnoreChownErrors != "" {

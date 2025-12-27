@@ -105,15 +105,17 @@ const (
 )
 
 type overlayOptions struct {
-	imageStores       []string
-	layerStores       []additionalLayerStore
-	quota             quota.Quota
-	mountProgram      string
-	skipMountHome     bool
-	mountOptions      string
-	ignoreChownErrors bool
-	forceMask         *os.FileMode
-	useComposefs      bool
+	imageStores          []string
+	layerStores          []additionalLayerStore
+	quota                quota.Quota
+	mountProgram         string
+	skipMountHome        bool
+	mountOptions         string
+	ignoreChownErrors    bool
+	forceMask            *os.FileMode
+	useComposefs         bool
+	imageFSType          string
+	imageFSCreateCommand string
 }
 
 // Driver contains information about the home directory and the list of active mounts that are created using this driver.
@@ -594,6 +596,12 @@ func parseOptions(options []string) (*overlayOptions, error) {
 			}
 			m := os.FileMode(mask)
 			o.forceMask = &m
+		case "image_fs_type":
+			logrus.Debugf("overlay: image_fs_type=%s", val)
+			o.imageFSType = val
+		case "image_fs_create_command":
+			logrus.Debugf("overlay: image_fs_create_command=%s", val)
+			o.imageFSCreateCommand = val
 		default:
 			return nil, fmt.Errorf("overlay: unknown option %s", key)
 		}
@@ -1677,10 +1685,21 @@ func (d *Driver) get(id string, disableShifting bool, options graphdriver.MountO
 
 	diffDir := path.Join(dir, "diff")
 
-	if dest, err := maybeAddComposefsMount(id, 0, readWrite); err != nil {
-		return "", err
-	} else if dest != "" {
-		diffDir = dest
+	// Check for image filesystem mount for the current layer
+	if d.options.imageFSType != "" {
+		if dest, err := d.maybeAddImageFSMount(id, dir, id, 0, readWrite, inAdditionalStore); err != nil {
+			return "", err
+		} else if dest != "" {
+			diffDir = dest
+		}
+	}
+	// Check for composefs mount for the current layer
+	if diffDir == path.Join(dir, "diff") {
+		if dest, err := maybeAddComposefsMount(id, 0, readWrite); err != nil {
+			return "", err
+		} else if dest != "" {
+			diffDir = dest
+		}
 	}
 
 	// For each lower, resolve its path, and append it and any additional diffN
@@ -1729,25 +1748,50 @@ func (d *Driver) get(id string, disableShifting bool, options graphdriver.MountO
 			return "", err
 		}
 		lowerID := filepath.Base(filepath.Dir(linkContent))
-		composefsMount, err := maybeAddComposefsMount(lowerID, i+1, readWrite)
-		if err != nil {
-			return "", err
+		var imagefsMount string
+		if d.options.imageFSType != "" {
+			imagefsMount, err = d.maybeAddImageFSMount(id, dir, lowerID, i+1, readWrite, inAdditionalStore)
+			if err != nil {
+				return "", err
+			}
 		}
-		if composefsMount != "" {
-			if needsIDMapping {
-				if err := idmap.CreateIDMappedMount(composefsMount, composefsMount, idmappedMountProcessPid); err != nil {
-					return "", fmt.Errorf("create mapped mount for %q: %w", composefsMount, err)
+		if imagefsMount == "" {
+			composefsMount, err := maybeAddComposefsMount(lowerID, i+1, readWrite)
+			if err != nil {
+				return "", err
+			}
+			if composefsMount != "" {
+				if needsIDMapping {
+					if err := idmap.CreateIDMappedMount(composefsMount, composefsMount, idmappedMountProcessPid); err != nil {
+						return "", fmt.Errorf("create mapped mount for %q: %w", composefsMount, err)
+					}
+					skipIDMappingLayers[composefsMount] = composefsMount
+					// overlay takes a reference on the mount, so it is safe to unmount
+					// the mapped idmounts as soon as the final overlay file system is mounted.
+					defer func() {
+						if err := unix.Unmount(composefsMount, unix.MNT_DETACH); err != nil {
+							logrus.Warnf("Unmount %q: %v", composefsMount, err)
+						}
+					}()
 				}
-				skipIDMappingLayers[composefsMount] = composefsMount
+				absLowers = append(absLowers, composefsMount)
+				continue
+			}
+		} else {
+			if needsIDMapping {
+				if err := idmap.CreateIDMappedMount(imagefsMount, imagefsMount, idmappedMountProcessPid); err != nil {
+					return "", fmt.Errorf("create mapped mount for %q: %w", imagefsMount, err)
+				}
+				skipIDMappingLayers[imagefsMount] = imagefsMount
 				// overlay takes a reference on the mount, so it is safe to unmount
 				// the mapped idmounts as soon as the final overlay file system is mounted.
 				defer func() {
-					if err := unix.Unmount(composefsMount, unix.MNT_DETACH); err != nil {
-						logrus.Warnf("Unmount %q: %v", composefsMount, err)
+					if err := unix.Unmount(imagefsMount, unix.MNT_DETACH); err != nil {
+						logrus.Warnf("Unmount %q: %v", imagefsMount, err)
 					}
 				}()
 			}
-			absLowers = append(absLowers, composefsMount)
+			absLowers = append(absLowers, imagefsMount)
 			continue
 		}
 
@@ -2471,6 +2515,60 @@ func (d *Driver) ApplyDiff(id string, options graphdriver.ApplyDiffOpts) (size i
 // This can run concurrently with any other driver operations, as such it is the
 // callers responsibility to ensure the target path passed is safe to use if that is the case.
 func (d *Driver) applyDiff(target string, options graphdriver.ApplyDiffOpts) (size int64, err error) {
+	// Handle image filesystem types (erofs, squashfs, etc.) by creating an image file
+	if d.options.imageFSType != "" {
+		layerDir := path.Dir(target)
+		imagePath := d.getImageFSData(path.Base(layerDir))
+
+		if d.options.imageFSCreateCommand == "" {
+			return 0, fmt.Errorf("image_fs_type %q requires an image_fs_create_command to be set", d.options.imageFSType)
+		}
+
+		// Create a temporary directory to untar the diff into, which the image creation tool needs as a source
+		tmpDir, err := os.MkdirTemp(d.home, fmt.Sprintf("%s-apply-diff-", d.options.imageFSType))
+		if err != nil {
+			return 0, fmt.Errorf("creating temporary directory for %s diff: %w", d.options.imageFSType, err)
+		}
+		defer os.RemoveAll(tmpDir)
+
+		// Untar the diff into the temporary directory
+		var uidMaps, gidMaps []idtools.IDMap
+		if options.Mappings != nil {
+			uidMaps = options.Mappings.UIDs()
+			gidMaps = options.Mappings.GIDs()
+		}
+		if _, err = archive.ApplyUncompressedLayer(tmpDir, options.Diff, &archive.TarOptions{
+			UIDMaps:           uidMaps,
+			GIDMaps:           gidMaps,
+			IgnoreChownErrors: options.IgnoreChownErrors,
+			WhiteoutFormat:    archive.OverlayWhiteoutFormat,
+		}); err != nil {
+			return 0, fmt.Errorf("untarring diff to temporary directory for %s: %w", d.options.imageFSType, err)
+		}
+
+		// Construct and execute the image creation command
+		// The command should accept the image path and source directory as arguments
+		args := strings.Fields(d.options.imageFSCreateCommand)
+		if len(args) == 0 {
+			return 0, fmt.Errorf("invalid image_fs_create_command")
+		}
+		cmd := exec.Command(args[0], append(args[1:], imagePath, tmpDir)...)
+		var stderrBuf bytes.Buffer
+		cmd.Stderr = &stderrBuf
+
+		if err = cmd.Run(); err != nil {
+			return 0, fmt.Errorf("executing image create command %q: %s %w", d.options.imageFSCreateCommand, stderrBuf.String(), err)
+		}
+
+		// Return the size of the created image
+		stat, err := os.Stat(imagePath)
+		if err != nil {
+			return 0, fmt.Errorf("getting size of %s image %q: %w", d.options.imageFSType, imagePath, err)
+		}
+		return stat.Size(), nil
+	}
+
+	// Default behavior: standard untar to the diff directory
 	idMappings := options.Mappings
 	if idMappings == nil {
 		idMappings = &idtools.IDMappings{}

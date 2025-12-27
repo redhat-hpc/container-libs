@@ -123,8 +123,15 @@ func (d *Driver) createImageFSFromDirectory(layerID, sourceDir, context string) 
 		return nil
 	}
 
-	if d.options.imageFSCreateCommand == "" {
-		return fmt.Errorf("image_fs_type %q requires an image_fs_create_command to be set", d.options.imageFSType)
+	// Use default command if not specified (only for erofs)
+	createCommand := d.options.imageFSCreateCommand
+	if createCommand == "" {
+		if d.options.imageFSType == "erofs" {
+			createCommand = "mkfs.erofs -z lz4 {{.ImagePath}} {{.TmpDir}}"
+			logrus.Debugf("overlay: %s: using default imagefs create command for erofs: %q", context, createCommand)
+		} else {
+			return fmt.Errorf("image_fs_type %q requires an image_fs_create_command to be set", d.options.imageFSType)
+		}
 	}
 
 	imagePath := d.getImageFSData(layerID)
@@ -137,7 +144,7 @@ func (d *Driver) createImageFSFromDirectory(layerID, sourceDir, context string) 
 	}
 
 	// Construct and execute the image creation command using template expansion
-	tmpl, err := template.New("image_fs_create_command").Parse(d.options.imageFSCreateCommand)
+	tmpl, err := template.New("image_fs_create_command").Parse(createCommand)
 	if err != nil {
 		return fmt.Errorf("parsing image_fs_create_command template: %w", err)
 	}

@@ -38,7 +38,8 @@ func (d *Driver) maybeAddImageFSMount(id, dir, lowerID string, i int, readWrite,
 		}
 		return "", err
 	}
-	dest := d.getStorePrivateDirectory(id, dir, fmt.Sprintf("imagefs-layers/%d", i), inAdditionalStore)
+	// Always store imagefs mount points in rundir to ensure they're always in a runtime directory
+	dest := path.Join(d.runhome, id, fmt.Sprintf("imagefs-layers/%d", i))
 	logrus.Debugf("overlay: computed mount destination: %q", dest)
 	if err := os.MkdirAll(dest, 0o700); err != nil {
 		return "", err

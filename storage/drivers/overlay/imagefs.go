@@ -6,18 +6,27 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path"
+	"path/filepath"
 	"strings"
 	"text/template"
 
 	"github.com/sirupsen/logrus"
+	graphdriver "go.podman.io/storage/drivers"
+	"go.podman.io/storage/pkg/archive"
 	"go.podman.io/storage/pkg/fileutils"
+	"go.podman.io/storage/pkg/idtools"
 	"go.podman.io/storage/pkg/loopback"
 	"go.podman.io/storage/pkg/unshare"
 	"golang.org/x/sys/unix"
 )
+
+// stagingLayerTarballName is the filename used in the staging directory for the
+// erofs tarball when applying a diff without untarring (staging path only).
+const stagingLayerTarballName = "layer.tar"
 
 // validateImageFSConfig validates imagefs configuration and checks for required tools.
 func validateImageFSConfig(opts *overlayOptions) error {
@@ -214,6 +223,199 @@ func (d *Driver) createImageFSFromDirectory(layerID, sourceDir, context string) 
 		return fmt.Errorf("image file was not created at %q: %w", imagePath, err)
 	}
 	logrus.Debugf("overlay: %s: verified image file exists, size=%d", context, stat.Size())
+	return nil
+}
+
+// createImageFSFromTarball creates an image filesystem directly from a tarball.
+// Used for erofs (and other types that support tar input) to avoid untarring.
+// The template supports ImagePath and Tarball variables.
+func (d *Driver) createImageFSFromTarball(layerID, tarballPath, context string) error {
+	if d.options.imageFSType == "" {
+		return nil
+	}
+
+	// For erofs, use a tarball-specific default (mkfs.erofs --tar=f accepts a tarball directly).
+	// image_fs_create_command is for directory input; from tarball we use this default.
+	var createCommand string
+	switch d.options.imageFSType {
+	case "erofs":
+		createCommand = "mkfs.erofs --tar=f -z lz4 {{.ImagePath}} {{.Tarball}}"
+		logrus.Debugf("overlay: %s: using default imagefs create command for erofs from tarball: %q", context, createCommand)
+	default:
+		return fmt.Errorf("createImageFSFromTarball: image_fs_type %q does not support tarball input (only erofs)", d.options.imageFSType)
+	}
+
+	imagePath := d.getImageFSData(layerID)
+	imageDir := path.Dir(imagePath)
+	logrus.Debugf("overlay: %s: creating imagefs from tarball, imagePath=%q, tarball=%q", context, imagePath, tarballPath)
+
+	if err := os.MkdirAll(imageDir, 0o755); err != nil {
+		return fmt.Errorf("creating directory for image file: %w", err)
+	}
+
+	tmpl, err := template.New("image_fs_create_command_tarball").Parse(createCommand)
+	if err != nil {
+		return fmt.Errorf("parsing image_fs_create_command template: %w", err)
+	}
+
+	var cmdBuf bytes.Buffer
+	templateData := struct {
+		ImagePath string
+		Tarball   string
+	}{
+		ImagePath: imagePath,
+		Tarball:   tarballPath,
+	}
+	if err = tmpl.Execute(&cmdBuf, templateData); err != nil {
+		return fmt.Errorf("executing image_fs_create_command template: %w", err)
+	}
+
+	expandedCmd := strings.TrimSpace(cmdBuf.String())
+	args := strings.Fields(expandedCmd)
+	if len(args) == 0 {
+		return fmt.Errorf("invalid image_fs_create_command: template expanded to empty command")
+	}
+	cmd := exec.Command(args[0], args[1:]...)
+	var stderrBuf bytes.Buffer
+	cmd.Stderr = &stderrBuf
+
+	if err = cmd.Run(); err != nil {
+		return fmt.Errorf("executing image create command %q: %s %w", expandedCmd, stderrBuf.String(), err)
+	}
+
+	logrus.Debugf("overlay: %s: successfully created image file at %q from tarball", context, imagePath)
+	stat, err := os.Stat(imagePath)
+	if err != nil {
+		return fmt.Errorf("image file was not created at %q: %w", imagePath, err)
+	}
+	logrus.Debugf("overlay: %s: verified image file exists, size=%d", context, stat.Size())
+	return nil
+}
+
+// applyDiffForImageFS handles applying a diff when image_fs_type is set.
+// It returns (size, true, nil) when it handled the diff (erofs tarball path or created image).
+// It returns (0, false, nil) when the caller should fall back to default untar (e.g. staging + squashfs).
+func (d *Driver) applyDiffForImageFS(target string, options graphdriver.ApplyDiffOpts) (size int64, handled bool, err error) {
+	if d.options.imageFSType == "" {
+		return 0, false, nil
+	}
+
+	isStagingDir := false
+	if targetAbs, absErr := filepath.Abs(target); absErr == nil {
+		for _, tempRoot := range d.GetTempDirRootDirs() {
+			if strings.HasPrefix(targetAbs, tempRoot) {
+				isStagingDir = true
+				break
+			}
+		}
+	}
+
+	if isStagingDir {
+		if d.options.imageFSType == "erofs" {
+			tarballPath := filepath.Join(target, stagingLayerTarballName)
+			f, err := os.Create(tarballPath)
+			if err != nil {
+				return 0, false, fmt.Errorf("creating staging tarball for erofs: %w", err)
+			}
+			n, err := io.Copy(f, options.Diff)
+			if err != nil {
+				_ = f.Close()
+				_ = os.Remove(tarballPath)
+				return 0, false, fmt.Errorf("writing staging tarball for erofs: %w", err)
+			}
+			if err := f.Close(); err != nil {
+				return 0, false, fmt.Errorf("closing staging tarball: %w", err)
+			}
+			logrus.Debugf("overlay: applyDiffForImageFS: wrote erofs tarball to staging %q (%d bytes)", tarballPath, n)
+			return n, true, nil
+		}
+		return 0, false, nil
+	}
+
+	// Direct apply: we have the layer ID. Create the image here.
+	layerDir := path.Dir(target)
+	layerID := path.Base(layerDir)
+
+	if d.options.imageFSType == "erofs" {
+		tarballFile, err := os.CreateTemp(d.home, fmt.Sprintf("%s-apply-diff-*.tar", d.options.imageFSType))
+		if err != nil {
+			return 0, false, fmt.Errorf("creating temporary tarball for %s diff: %w", d.options.imageFSType, err)
+		}
+		tarballPath := tarballFile.Name()
+		defer os.Remove(tarballPath)
+		if _, err := io.Copy(tarballFile, options.Diff); err != nil {
+			_ = tarballFile.Close()
+			return 0, false, fmt.Errorf("writing diff to temporary tarball for %s: %w", d.options.imageFSType, err)
+		}
+		if err := tarballFile.Close(); err != nil {
+			return 0, false, fmt.Errorf("closing temporary tarball: %w", err)
+		}
+		if err := d.createImageFSFromTarball(layerID, tarballPath, "applyDiff"); err != nil {
+			return 0, false, err
+		}
+		imagePath := d.getImageFSData(layerID)
+		stat, err := os.Stat(imagePath)
+		if err != nil {
+			return 0, false, fmt.Errorf("getting size of %s image %q: %w", d.options.imageFSType, imagePath, err)
+		}
+		return stat.Size(), true, nil
+	}
+
+	// squashfs etc.: untar into tmp dir, create image from directory
+	tmpDir, err := os.MkdirTemp(d.home, fmt.Sprintf("%s-apply-diff-", d.options.imageFSType))
+	if err != nil {
+		return 0, false, fmt.Errorf("creating temporary directory for %s diff: %w", d.options.imageFSType, err)
+	}
+	defer os.RemoveAll(tmpDir)
+	var uidMaps, gidMaps []idtools.IDMap
+	if options.Mappings != nil {
+		uidMaps = options.Mappings.UIDs()
+		gidMaps = options.Mappings.GIDs()
+	}
+	if _, err = archive.ApplyUncompressedLayer(tmpDir, options.Diff, &archive.TarOptions{
+		UIDMaps:           uidMaps,
+		GIDMaps:           gidMaps,
+		IgnoreChownErrors: options.IgnoreChownErrors,
+		WhiteoutFormat:    archive.OverlayWhiteoutFormat,
+	}); err != nil {
+		return 0, false, fmt.Errorf("untarring diff to temporary directory for %s: %w", d.options.imageFSType, err)
+	}
+	if err := d.createImageFSFromDirectory(layerID, tmpDir, "applyDiff"); err != nil {
+		return 0, false, err
+	}
+	imagePath := d.getImageFSData(layerID)
+	stat, err := os.Stat(imagePath)
+	if err != nil {
+		return 0, false, fmt.Errorf("getting size of %s image %q: %w", d.options.imageFSType, imagePath, err)
+	}
+	return stat.Size(), true, nil
+}
+
+// commitStagedLayerForImageFS creates the image filesystem from the staging directory (or tarball)
+// and removes the staging directory. Caller must ensure d.options.imageFSType != "".
+func (d *Driver) commitStagedLayerForImageFS(id, stagingPath, applyDir string) error {
+	tarballPath := filepath.Join(stagingPath, stagingLayerTarballName)
+	if d.options.imageFSType == "erofs" {
+		if _, err := os.Stat(tarballPath); err == nil {
+			if err := d.createImageFSFromTarball(id, tarballPath, "CommitStagedLayer"); err != nil {
+				return err
+			}
+		} else {
+			if err := d.createImageFSFromDirectory(id, stagingPath, "CommitStagedLayer"); err != nil {
+				return err
+			}
+		}
+	} else {
+		if err := d.createImageFSFromDirectory(id, stagingPath, "CommitStagedLayer"); err != nil {
+			return err
+		}
+	}
+	if err := os.RemoveAll(stagingPath); err != nil {
+		return fmt.Errorf("removing staging directory after image creation: %w", err)
+	}
+	if err := os.MkdirAll(applyDir, 0o755); err != nil {
+		return fmt.Errorf("creating diff directory: %w", err)
+	}
 	return nil
 }
 

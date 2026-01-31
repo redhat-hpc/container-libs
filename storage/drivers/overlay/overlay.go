@@ -2559,22 +2559,8 @@ func (d *Driver) CommitStagedLayer(id string, sa *tempdir.StagedAddition) error 
 		return err
 	}
 
-	// Handle image filesystem creation from staging directory
 	if d.options.imageFSType != "" {
-		if err := d.createImageFSFromDirectory(id, sa.Path, "CommitStagedLayer"); err != nil {
-			return err
-		}
-
-		// Remove the staging directory since we've created the image file
-		// The diffPath will be created by the Commit call, but we don't need the staging dir contents
-		if err := os.RemoveAll(sa.Path); err != nil {
-			return fmt.Errorf("removing staging directory after image creation: %w", err)
-		}
-		// Ensure the diff directory exists (it will be empty, but that's okay)
-		if err := os.MkdirAll(applyDir, 0o755); err != nil {
-			return fmt.Errorf("creating diff directory: %w", err)
-		}
-		return nil
+		return d.commitStagedLayerForImageFS(id, sa.Path, applyDir)
 	}
 
 	// The os.Rename() function used by CommitFunc errors when the target directory already
@@ -2600,76 +2586,17 @@ func (d *Driver) ApplyDiff(id string, options graphdriver.ApplyDiffOpts) (size i
 // This can run concurrently with any other driver operations, as such it is the
 // callers responsibility to ensure the target path passed is safe to use if that is the case.
 func (d *Driver) applyDiff(target string, options graphdriver.ApplyDiffOpts) (size int64, err error) {
-	// Handle image filesystem types (erofs, squashfs, etc.) by creating an image file
-	// Note: Skip imagefs creation if target is in a staging/temp directory.
-	// Imagefs creation will be handled in ApplyDiffFromStagingDirectory where we have the layer ID.
-	skipImageFSCreation := false
-	if d.options.imageFSType != "" {
-		// Check if target is in a staging/temp directory
-		targetAbs, err := filepath.Abs(target)
-		if err == nil {
-			tempDirRoots := d.GetTempDirRootDirs()
-			for _, tempRoot := range tempDirRoots {
-				if strings.HasPrefix(targetAbs, tempRoot) {
-					// This is a staging directory, skip imagefs creation here
-					// It will be handled in ApplyDiffFromStagingDirectory
-					logrus.Debugf("overlay: applyDiff: skipping imagefs creation for staging directory %q", target)
-					skipImageFSCreation = true
-					break
-				}
-			}
-		}
-
-		if !skipImageFSCreation {
-			// Use the standard location based on the target directory
-			layerDir := path.Dir(target)
-			layerID := path.Base(layerDir)
-
-			// Create a temporary directory to untar the diff into, which the image creation tool needs as a source
-			tmpDir, err := os.MkdirTemp(d.home, fmt.Sprintf("%s-apply-diff-", d.options.imageFSType))
-			if err != nil {
-				return 0, fmt.Errorf("creating temporary directory for %s diff: %w", d.options.imageFSType, err)
-			}
-			defer os.RemoveAll(tmpDir)
-
-			// Untar the diff into the temporary directory
-			var uidMaps, gidMaps []idtools.IDMap
-			if options.Mappings != nil {
-				uidMaps = options.Mappings.UIDs()
-				gidMaps = options.Mappings.GIDs()
-			}
-			if _, err = archive.ApplyUncompressedLayer(tmpDir, options.Diff, &archive.TarOptions{
-				UIDMaps:           uidMaps,
-				GIDMaps:           gidMaps,
-				IgnoreChownErrors: options.IgnoreChownErrors,
-				WhiteoutFormat:    archive.OverlayWhiteoutFormat,
-			}); err != nil {
-				return 0, fmt.Errorf("untarring diff to temporary directory for %s: %w", d.options.imageFSType, err)
-			}
-
-			// Create the image filesystem from the temporary directory
-			if err := d.createImageFSFromDirectory(layerID, tmpDir, "applyDiff"); err != nil {
-				return 0, err
-			}
-
-			// Return the size of the created image
-			imagePath := d.getImageFSData(layerID)
-			stat, err := os.Stat(imagePath)
-			if err != nil {
-				return 0, fmt.Errorf("getting size of %s image %q: %w", d.options.imageFSType, imagePath, err)
-			}
-			return stat.Size(), nil
-		}
+	if size, handled, err := d.applyDiffForImageFS(target, options); err != nil {
+		return 0, err
+	} else if handled {
+		return size, nil
 	}
 
-	// Default behavior: standard untar to the diff directory
 	idMappings := options.Mappings
 	if idMappings == nil {
 		idMappings = &idtools.IDMappings{}
 	}
-
 	logrus.Debugf("Applying tar in %s", target)
-	// Overlay doesn't need the parent id to apply the diff
 	if err := untar(options.Diff, target, &archive.TarOptions{
 		UIDMaps:           idMappings.UIDs(),
 		GIDMaps:           idMappings.GIDs(),
@@ -2680,7 +2607,6 @@ func (d *Driver) applyDiff(target string, options graphdriver.ApplyDiffOpts) (si
 	}); err != nil {
 		return 0, err
 	}
-
 	return directory.Size(target)
 }
 

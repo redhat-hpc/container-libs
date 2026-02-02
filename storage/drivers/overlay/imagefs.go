@@ -28,6 +28,38 @@ import (
 // erofs tarball when applying a diff without untarring (staging path only).
 const stagingLayerTarballName = "layer.tar"
 
+// imageFSDefault holds default tool name, create command templates, and mount program per image_fs_type.
+// createFromDir is the template for directory input (variables: ImagePath, TmpDir).
+// createFromTarball is the template for tarball input (variables: ImagePath, Tarball); empty if not supported.
+// mountProgram is the mount program for rootless (e.g. "erofsfuse"); empty if none or not applicable.
+type imageFSDefault struct {
+	toolName          string
+	createFromDir     string
+	createFromTarball string
+	mountProgram      string
+}
+
+var imageFSDefaults = map[string]imageFSDefault{
+	"erofs": {
+		toolName:          "mkfs.erofs",
+		createFromDir:     "mkfs.erofs -z lz4 {{.ImagePath}} {{.TmpDir}}",
+		createFromTarball: "mkfs.erofs --tar=f -z lz4 {{.ImagePath}} {{.Tarball}}",
+		mountProgram:      "erofsfuse",
+	},
+	// "squashfs": {
+	// 	toolName:          "mksquashfs",
+	// 	createFromDir:     "mksquashfs {{.TmpDir}} {{.ImagePath}}",
+	// 	createFromTarball: "",
+	// 	mountProgram:      "squashfuse",
+	// },
+	"squashfs": {
+		toolName:          "gensquashfs",
+		createFromDir:     "gensquashfs -D {{.TmpDir}} {{.ImagePath}}",
+		createFromTarball: "tar2sqfs {{.ImagePath}}",
+		mountProgram:      "squashfuse",
+	},
+}
+
 // validateImageFSConfig validates imagefs configuration and checks for required tools.
 func validateImageFSConfig(opts *overlayOptions) error {
 	if opts.imageFSType == "" {
@@ -36,21 +68,14 @@ func validateImageFSConfig(opts *overlayOptions) error {
 
 	// If create command is not specified, check if default tool exists
 	if opts.imageFSCreateCommand == "" {
-		var toolName string
-		switch opts.imageFSType {
-		case "erofs":
-			toolName = "mkfs.erofs"
-		case "squashfs":
-			toolName = "mksquashfs"
-		default:
+		def, ok := imageFSDefaults[opts.imageFSType]
+		if !ok {
 			return fmt.Errorf("image_fs_type %q requires an image_fs_create_command to be set", opts.imageFSType)
 		}
-
-		// Check if the default tool exists
-		if _, err := exec.LookPath(toolName); err != nil {
-			return fmt.Errorf("image_fs_type %q requires %s to be available (or set image_fs_create_command)", opts.imageFSType, toolName)
+		if _, err := exec.LookPath(def.toolName); err != nil {
+			return fmt.Errorf("image_fs_type %q requires %s to be available (or set image_fs_create_command)", opts.imageFSType, def.toolName)
 		}
-		logrus.Debugf("overlay: validated default tool %q for image_fs_type %q", toolName, opts.imageFSType)
+		logrus.Debugf("overlay: validated default tool %q for image_fs_type %q", def.toolName, opts.imageFSType)
 	}
 
 	return nil
@@ -160,20 +185,15 @@ func (d *Driver) createImageFSFromDirectory(layerID, sourceDir, context string) 
 		return nil
 	}
 
-	// Use default command if not specified (for erofs and squashfs)
 	createCommand := d.options.imageFSCreateCommand
 	if createCommand == "" {
-		switch d.options.imageFSType {
-		case "erofs":
-			createCommand = "mkfs.erofs -z lz4 {{.ImagePath}} {{.TmpDir}}"
-			logrus.Debugf("overlay: %s: using default imagefs create command for erofs: %q", context, createCommand)
-		case "squashfs":
-			createCommand = "mksquashfs {{.TmpDir}} {{.ImagePath}}"
-			logrus.Debugf("overlay: %s: using default imagefs create command for squashfs: %q", context, createCommand)
-		default:
+		def, ok := imageFSDefaults[d.options.imageFSType]
+		if !ok || def.createFromDir == "" {
 			return fmt.Errorf("image_fs_type %q requires an image_fs_create_command to be set", d.options.imageFSType)
 		}
+		createCommand = def.createFromDir
 	}
+	logrus.Debugf("overlay: %s: imagefs create command template: %q", context, createCommand)
 
 	imagePath := d.getImageFSData(layerID)
 	imageDir := path.Dir(imagePath)
@@ -226,24 +246,118 @@ func (d *Driver) createImageFSFromDirectory(layerID, sourceDir, context string) 
 	return nil
 }
 
-// createImageFSFromTarball creates an image filesystem directly from a tarball.
-// Used for erofs (and other types that support tar input) to avoid untarring.
-// The template supports ImagePath and Tarball variables.
+// imageFSSupportsTarball returns true if the default for this image_fs_type has createFromTarball.
+// When true, we use the tarball path (staging tarball or create from tarball); when false, we use create from directory only.
+func (d *Driver) imageFSSupportsTarball() bool {
+	def := imageFSDefaults[d.options.imageFSType]
+	return def.createFromTarball != ""
+}
+
+// getTarballCreateCommandTemplate returns the create command template used for tarball input.
+// Uses image_fs_create_command if set, otherwise the default createFromTarball for the fs type.
+// Returns empty string if the fs type does not support tarball input.
+func (d *Driver) getTarballCreateCommandTemplate() string {
+	if d.options.imageFSCreateCommand != "" {
+		return d.options.imageFSCreateCommand
+	}
+	def := imageFSDefaults[d.options.imageFSType]
+	return def.createFromTarball
+}
+
+// imageFSTarballWantsStdin returns true if the tarball create command template does not
+// contain {{.Tarball}} or {{.TmpDir}}, meaning the command expects the tarball on stdin.
+func (d *Driver) imageFSTarballWantsStdin() bool {
+	tmpl := d.getTarballCreateCommandTemplate()
+	if tmpl == "" {
+		return false
+	}
+	return !strings.Contains(tmpl, "{{.Tarball}}") && !strings.Contains(tmpl, "{{.TmpDir}}")
+}
+
+// imageFSCreateCommandWantsDirectory returns true when the create command template
+// contains {{.TmpDir}}, meaning it expects directory input rather than a tarball.
+// When true, applyDiff and commit must use the directory path (untar then create)
+// so that TmpDir is populated and passed correctly.
+func (d *Driver) imageFSCreateCommandWantsDirectory() bool {
+	tmpl := d.getTarballCreateCommandTemplate()
+	return tmpl != "" && strings.Contains(tmpl, "{{.TmpDir}}")
+}
+
+// createImageFSFromTarballReader creates an image filesystem from a tarball read from stdin.
+// Used when the create command template has no {{.Tarball}} or {{.TmpDir}} (streaming from stdin).
+func (d *Driver) createImageFSFromTarballReader(layerID string, diff io.Reader, context string) error {
+	if d.options.imageFSType == "" {
+		return nil
+	}
+	createCommand := d.getTarballCreateCommandTemplate()
+	if createCommand == "" {
+		return fmt.Errorf("createImageFSFromTarballReader: image_fs_type %q does not support tarball input", d.options.imageFSType)
+	}
+	logrus.Debugf("overlay: %s: imagefs create command template: %q", context, createCommand)
+	logrus.Debugf("overlay: %s: creating imagefs from tarball stdin, imagePath from template", context)
+
+	imagePath := d.getImageFSData(layerID)
+	imageDir := path.Dir(imagePath)
+	if err := os.MkdirAll(imageDir, 0o755); err != nil {
+		return fmt.Errorf("creating directory for image file: %w", err)
+	}
+
+	tmpl, err := template.New("image_fs_create_command_tarball_stdin").Parse(createCommand)
+	if err != nil {
+		return fmt.Errorf("parsing image_fs_create_command template: %w", err)
+	}
+
+	var cmdBuf bytes.Buffer
+	templateData := struct {
+		ImagePath string
+		ImageDir  string
+		Tarball   string
+		TmpDir    string
+	}{
+		ImagePath: imagePath,
+		ImageDir:  imageDir,
+		Tarball:   "-",
+		TmpDir:    "",
+	}
+	if err = tmpl.Execute(&cmdBuf, templateData); err != nil {
+		return fmt.Errorf("executing image_fs_create_command template: %w", err)
+	}
+
+	expandedCmd := strings.TrimSpace(cmdBuf.String())
+	args := strings.Fields(expandedCmd)
+	if len(args) == 0 {
+		return fmt.Errorf("invalid image_fs_create_command: template expanded to empty command")
+	}
+	cmd := exec.Command(args[0], args[1:]...)
+	cmd.Stdin = diff
+	var stderrBuf bytes.Buffer
+	cmd.Stderr = &stderrBuf
+
+	if err = cmd.Run(); err != nil {
+		return fmt.Errorf("executing image create command %q: %s %w", expandedCmd, stderrBuf.String(), err)
+	}
+
+	logrus.Debugf("overlay: %s: successfully created image file at %q from tarball stdin", context, imagePath)
+	stat, err := os.Stat(imagePath)
+	if err != nil {
+		return fmt.Errorf("image file was not created at %q: %w", imagePath, err)
+	}
+	logrus.Debugf("overlay: %s: verified image file exists, size=%d", context, stat.Size())
+	return nil
+}
+
+// createImageFSFromTarball creates an image filesystem directly from a tarball file.
+// Used for fs types that support tarball input (see imageFSDefaults.createFromTarball).
+// The template supports ImagePath, ImageDir, Tarball, and TmpDir variables.
 func (d *Driver) createImageFSFromTarball(layerID, tarballPath, context string) error {
 	if d.options.imageFSType == "" {
 		return nil
 	}
-
-	// For erofs, use a tarball-specific default (mkfs.erofs --tar=f accepts a tarball directly).
-	// image_fs_create_command is for directory input; from tarball we use this default.
-	var createCommand string
-	switch d.options.imageFSType {
-	case "erofs":
-		createCommand = "mkfs.erofs --tar=f -z lz4 {{.ImagePath}} {{.Tarball}}"
-		logrus.Debugf("overlay: %s: using default imagefs create command for erofs from tarball: %q", context, createCommand)
-	default:
-		return fmt.Errorf("createImageFSFromTarball: image_fs_type %q does not support tarball input (only erofs)", d.options.imageFSType)
+	createCommand := d.getTarballCreateCommandTemplate()
+	if createCommand == "" {
+		return fmt.Errorf("createImageFSFromTarball: image_fs_type %q does not support tarball input", d.options.imageFSType)
 	}
+	logrus.Debugf("overlay: %s: imagefs create command template: %q", context, createCommand)
 
 	imagePath := d.getImageFSData(layerID)
 	imageDir := path.Dir(imagePath)
@@ -261,10 +375,14 @@ func (d *Driver) createImageFSFromTarball(layerID, tarballPath, context string) 
 	var cmdBuf bytes.Buffer
 	templateData := struct {
 		ImagePath string
+		ImageDir  string
 		Tarball   string
+		TmpDir    string
 	}{
 		ImagePath: imagePath,
+		ImageDir:  imageDir,
 		Tarball:   tarballPath,
+		TmpDir:    "",
 	}
 	if err = tmpl.Execute(&cmdBuf, templateData); err != nil {
 		return fmt.Errorf("executing image_fs_create_command template: %w", err)
@@ -293,8 +411,8 @@ func (d *Driver) createImageFSFromTarball(layerID, tarballPath, context string) 
 }
 
 // applyDiffForImageFS handles applying a diff when image_fs_type is set.
-// It returns (size, true, nil) when it handled the diff (erofs tarball path or created image).
-// It returns (0, false, nil) when the caller should fall back to default untar (e.g. staging + squashfs).
+// It returns (size, true, nil) when it handled the diff (staging tarball or created image).
+// It returns (0, false, nil) when the caller should fall back to default untar.
 func (d *Driver) applyDiffForImageFS(target string, options graphdriver.ApplyDiffOpts) (size int64, handled bool, err error) {
 	if d.options.imageFSType == "" {
 		return 0, false, nil
@@ -310,25 +428,26 @@ func (d *Driver) applyDiffForImageFS(target string, options graphdriver.ApplyDif
 		}
 	}
 
-	if isStagingDir {
-		if d.options.imageFSType == "erofs" {
-			tarballPath := filepath.Join(target, stagingLayerTarballName)
-			f, err := os.Create(tarballPath)
-			if err != nil {
-				return 0, false, fmt.Errorf("creating staging tarball for erofs: %w", err)
-			}
-			n, err := io.Copy(f, options.Diff)
-			if err != nil {
-				_ = f.Close()
-				_ = os.Remove(tarballPath)
-				return 0, false, fmt.Errorf("writing staging tarball for erofs: %w", err)
-			}
-			if err := f.Close(); err != nil {
-				return 0, false, fmt.Errorf("closing staging tarball: %w", err)
-			}
-			logrus.Debugf("overlay: applyDiffForImageFS: wrote erofs tarball to staging %q (%d bytes)", tarballPath, n)
-			return n, true, nil
+	// If the default for this fs type has createFromTarball, write the diff as a staging tarball.
+	if isStagingDir && d.imageFSSupportsTarball() {
+		tarballPath := filepath.Join(target, stagingLayerTarballName)
+		f, err := os.Create(tarballPath)
+		if err != nil {
+			return 0, false, fmt.Errorf("creating staging tarball for imagefs: %w", err)
 		}
+		n, err := io.Copy(f, options.Diff)
+		if err != nil {
+			_ = f.Close()
+			_ = os.Remove(tarballPath)
+			return 0, false, fmt.Errorf("writing staging tarball for imagefs: %w", err)
+		}
+		if err := f.Close(); err != nil {
+			return 0, false, fmt.Errorf("closing staging tarball: %w", err)
+		}
+		logrus.Debugf("overlay: applyDiffForImageFS: wrote imagefs tarball to staging %q (%d bytes)", tarballPath, n)
+		return n, true, nil
+	}
+	if isStagingDir {
 		return 0, false, nil
 	}
 
@@ -336,7 +455,54 @@ func (d *Driver) applyDiffForImageFS(target string, options graphdriver.ApplyDif
 	layerDir := path.Dir(target)
 	layerID := path.Base(layerDir)
 
-	if d.options.imageFSType == "erofs" {
+	// If the create command template uses {{.TmpDir}}, we must use the directory path
+	// (untar then create) so TmpDir is populated. Otherwise we would call the tarball
+	// path with TmpDir empty and the command would get wrong arguments.
+	if d.imageFSCreateCommandWantsDirectory() {
+		// Extract to system temp dir to avoid "too many links" (EMLINK) on storage
+		// filesystems that limit hardlinks (e.g. NFS, some overlay setups).
+		tmpDir, err := os.MkdirTemp(os.TempDir(), fmt.Sprintf("containers-%s-apply-diff-", d.options.imageFSType))
+		if err != nil {
+			return 0, false, fmt.Errorf("creating temporary directory for %s diff: %w", d.options.imageFSType, err)
+		}
+		defer os.RemoveAll(tmpDir)
+		var uidMaps, gidMaps []idtools.IDMap
+		if options.Mappings != nil {
+			uidMaps = options.Mappings.UIDs()
+			gidMaps = options.Mappings.GIDs()
+		}
+		if _, err = archive.ApplyUncompressedLayer(tmpDir, options.Diff, &archive.TarOptions{
+			UIDMaps:           uidMaps,
+			GIDMaps:           gidMaps,
+			IgnoreChownErrors: options.IgnoreChownErrors,
+			WhiteoutFormat:    archive.OverlayWhiteoutFormat,
+		}); err != nil {
+			return 0, false, fmt.Errorf("untarring diff to temporary directory for %s: %w", d.options.imageFSType, err)
+		}
+		if err := d.createImageFSFromDirectory(layerID, tmpDir, "applyDiff"); err != nil {
+			return 0, false, err
+		}
+		imagePath := d.getImageFSData(layerID)
+		stat, err := os.Stat(imagePath)
+		if err != nil {
+			return 0, false, fmt.Errorf("getting size of %s image %q: %w", d.options.imageFSType, imagePath, err)
+		}
+		return stat.Size(), true, nil
+	}
+
+	// If the default for this fs type has createFromTarball, create from tarball (stdin or temp file).
+	if d.imageFSSupportsTarball() {
+		if d.imageFSTarballWantsStdin() {
+			if err := d.createImageFSFromTarballReader(layerID, options.Diff, "applyDiff"); err != nil {
+				return 0, false, err
+			}
+			imagePath := d.getImageFSData(layerID)
+			stat, err := os.Stat(imagePath)
+			if err != nil {
+				return 0, false, fmt.Errorf("getting size of %s image %q: %w", d.options.imageFSType, imagePath, err)
+			}
+			return stat.Size(), true, nil
+		}
 		tarballFile, err := os.CreateTemp(d.home, fmt.Sprintf("%s-apply-diff-*.tar", d.options.imageFSType))
 		if err != nil {
 			return 0, false, fmt.Errorf("creating temporary tarball for %s diff: %w", d.options.imageFSType, err)
@@ -361,7 +527,7 @@ func (d *Driver) applyDiffForImageFS(target string, options graphdriver.ApplyDif
 		return stat.Size(), true, nil
 	}
 
-	// squashfs etc.: untar into tmp dir, create image from directory
+	// Default has no createFromTarball: untar into tmp dir, then create image from directory.
 	tmpDir, err := os.MkdirTemp(d.home, fmt.Sprintf("%s-apply-diff-", d.options.imageFSType))
 	if err != nil {
 		return 0, false, fmt.Errorf("creating temporary directory for %s diff: %w", d.options.imageFSType, err)
@@ -393,19 +559,53 @@ func (d *Driver) applyDiffForImageFS(target string, options graphdriver.ApplyDif
 
 // commitStagedLayerForImageFS creates the image filesystem from the staging directory (or tarball)
 // and removes the staging directory. Caller must ensure d.options.imageFSType != "".
+// If the default has createFromTarball and a staging tarball exists, create from tarball (stdin or file path); otherwise create from directory.
 func (d *Driver) commitStagedLayerForImageFS(id, stagingPath, applyDir string) error {
 	tarballPath := filepath.Join(stagingPath, stagingLayerTarballName)
-	if d.options.imageFSType == "erofs" {
-		if _, err := os.Stat(tarballPath); err == nil {
-			if err := d.createImageFSFromTarball(id, tarballPath, "CommitStagedLayer"); err != nil {
+	hasStagingTarball := false
+	if _, err := os.Stat(tarballPath); err == nil {
+		hasStagingTarball = true
+	}
+
+	// If the create command uses {{.TmpDir}}, we must extract and use directory path.
+	if d.imageFSCreateCommandWantsDirectory() && hasStagingTarball {
+		// Extract to system temp dir (e.g. /tmp) to avoid "too many links" (EMLINK)
+		// on storage filesystems that limit hardlinks (e.g. NFS, some overlay setups).
+		tmpDir, err := os.MkdirTemp(os.TempDir(), fmt.Sprintf("containers-%s-commit-staged-", d.options.imageFSType))
+		if err != nil {
+			return fmt.Errorf("creating temporary directory for staged layer: %w", err)
+		}
+		defer os.RemoveAll(tmpDir)
+		f, err := os.Open(tarballPath)
+		if err != nil {
+			return fmt.Errorf("opening staging tarball: %w", err)
+		}
+		_, err = archive.ApplyUncompressedLayer(tmpDir, f, &archive.TarOptions{WhiteoutFormat: archive.OverlayWhiteoutFormat})
+		_ = f.Close()
+		if err != nil {
+			return fmt.Errorf("untarring staging tarball: %w", err)
+		}
+		if err := d.createImageFSFromDirectory(id, tmpDir, "CommitStagedLayer"); err != nil {
+			return err
+		}
+	} else if d.imageFSSupportsTarball() && hasStagingTarball {
+		if d.imageFSTarballWantsStdin() {
+			f, err := os.Open(tarballPath)
+			if err != nil {
+				return fmt.Errorf("opening staging tarball for stdin: %w", err)
+			}
+			err = d.createImageFSFromTarballReader(id, f, "CommitStagedLayer")
+			_ = f.Close() // close before RemoveAll so the file can be removed on all platforms
+			if err != nil {
 				return err
 			}
 		} else {
-			if err := d.createImageFSFromDirectory(id, stagingPath, "CommitStagedLayer"); err != nil {
+			if err := d.createImageFSFromTarball(id, tarballPath, "CommitStagedLayer"); err != nil {
 				return err
 			}
 		}
 	} else {
+		// No staging tarball, or fs type has no createFromTarball: stagingPath is the directory.
 		if err := d.createImageFSFromDirectory(id, stagingPath, "CommitStagedLayer"); err != nil {
 			return err
 		}
@@ -421,20 +621,11 @@ func (d *Driver) commitStagedLayerForImageFS(id, stagingPath, applyDir string) e
 
 func (d *Driver) mountImageFSBlob(imageBlob, dest, fsType string) error {
 	logrus.Debugf("overlay: mounting %s image blob %q to %q", fsType, imageBlob, dest)
-	// If rootless, try to find a FUSE mount program for this filesystem type
+	// If rootless, try the default FUSE mount program for this image_fs_type
 	if unshare.IsRootless() {
-		// Try to find a FUSE mount program for this filesystem type
-		// Common ones: fuse2fs (ext2/3/4), erofsfuse, squashfuse (squashfs)
-		fusePrograms := map[string]string{
-			"erofs":    "erofsfuse",
-			"squashfs": "squashfuse",
-			"ext2":     "fuse2fs",
-			"ext3":     "fuse2fs",
-			"ext4":     "fuse2fs",
-		}
-		if fuseProg, ok := fusePrograms[fsType]; ok {
-			if path, err := exec.LookPath(fuseProg); err == nil {
-				return d.mountImageFSWithProgram(imageBlob, dest, fsType, path)
+		if def, ok := imageFSDefaults[fsType]; ok && def.mountProgram != "" {
+			if mountPath, err := exec.LookPath(def.mountProgram); err == nil {
+				return d.mountImageFSWithProgram(imageBlob, dest, fsType, mountPath)
 			}
 		}
 		// Fall through to try new mount API (works on newer kernels for rootless)
@@ -462,7 +653,11 @@ func (d *Driver) mountImageFSBlob(imageBlob, dest, fsType string) error {
 
 	// Fall back to loop device + mount (rootful only, or if new API fails)
 	if unshare.IsRootless() {
-		return fmt.Errorf("rootless mount of %s requires a FUSE mount program (e.g., erofsfuse, squashfuse) to be available", fsType)
+		hint := "a FUSE mount program"
+		if def, ok := imageFSDefaults[fsType]; ok && def.mountProgram != "" {
+			hint = def.mountProgram
+		}
+		return fmt.Errorf("rootless mount of %s requires %s to be available", fsType, hint)
 	}
 	return d.mountImageFSWithLoop(imageBlob, dest, fsType)
 }

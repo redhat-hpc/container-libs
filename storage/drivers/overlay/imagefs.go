@@ -70,9 +70,11 @@ func validateImageFSConfig(opts *overlayOptions) error {
 	if opts.imageFSCreateCommand == "" {
 		def, ok := imageFSDefaults[opts.imageFSType]
 		if !ok {
+			logrus.Errorf("image_fs_type %q requires an image_fs_create_command to be set", opts.imageFSType)
 			return fmt.Errorf("image_fs_type %q requires an image_fs_create_command to be set", opts.imageFSType)
 		}
 		if _, err := exec.LookPath(def.toolName); err != nil {
+			logrus.Errorf("image_fs_type %q requires %s to be available (or set image_fs_create_command)", opts.imageFSType, def.toolName)
 			return fmt.Errorf("image_fs_type %q requires %s to be available (or set image_fs_create_command)", opts.imageFSType, def.toolName)
 		}
 		logrus.Debugf("overlay: validated default tool %q for image_fs_type %q", def.toolName, opts.imageFSType)

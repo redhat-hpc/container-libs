@@ -1129,7 +1129,11 @@ func (d *Driver) create(id, parent string, opts *graphdriver.CreateOpts, readOnl
 	if d.options.forceMask != nil {
 		st.Mode |= os.ModeDir
 		if err := idtools.SetContainersOverrideXattr(diff, st); err != nil {
-			return err
+			if !errors.Is(err, system.ENOTSUP) && !(unshare.IsRootless() && errors.Is(err, syscall.EPERM)) {
+				return err
+			}
+			// Ignore xattr errors on filesystems that don't support them (e.g. NFS)
+			logrus.Warnf("overlay: could not set override xattr on layer diff (filesystem may not support xattrs): %v", err)
 		}
 	}
 
@@ -1851,11 +1855,19 @@ func (d *Driver) get(id string, disableShifting bool, options graphdriver.MountO
 
 	if err := idtools.MkdirAllAs(diffDir, perms, rootUID, rootGID); err != nil {
 		if !inAdditionalStore {
-			return "", err
-		}
-		// if it is in an additional store, do not fail if the directory already exists
-		if err2 := fileutils.Exists(diffDir); err2 != nil {
-			return "", err
+			// On NFS with keep-id (rootless), chown can fail with EPERM; ensure the dir exists and continue.
+			if (d.options.ignoreChownErrors || unshare.IsRootless()) && errors.Is(err, syscall.EPERM) {
+				if mkdirErr := os.MkdirAll(diffDir, perms); mkdirErr != nil {
+					return "", mkdirErr
+				}
+			} else {
+				return "", err
+			}
+		} else {
+			// if it is in an additional store, do not fail if the directory already exists
+			if err2 := fileutils.Exists(diffDir); err2 != nil {
+				return "", err
+			}
 		}
 	}
 
@@ -1963,9 +1975,16 @@ func (d *Driver) get(id string, disableShifting bool, options graphdriver.MountO
 				label = d.optsAppendMappings(label, options.UidMaps, options.GidMaps)
 			}
 
-			// if forceMask is in place, tell fuse-overlayfs to write the permissions mask to an unprivileged xattr as well.
+			// if forceMask is in place, tell fuse-overlayfs to use the override xattr for permissions.
+			// Skip when the upperdir (diffDir) doesn't support xattr reads (e.g. NFS). Llistxattr can
+			// succeed on NFS with an empty list, so we probe with Lgetxattr which fails with ENOTSUP
+			// when the FS doesn't support xattrs.
 			if d.options.forceMask != nil {
-				label = label + ",xattr_permissions=2"
+				if _, err := system.Lgetxattr(diffDir, idtools.ContainersOverrideXattr); err == nil || !errors.Is(err, system.ENOTSUP) {
+					label = label + ",xattr_permissions=2"
+				} else {
+					logrus.Warnf("overlay: skipping xattr_permissions=2 (upperdir %q does not support xattrs)", diffDir)
+				}
 			}
 
 			mountProgram := exec.Command(d.options.mountProgram, "-o", label, target)
@@ -2538,7 +2557,10 @@ func (d *Driver) StartStagingDiffToApply(parent string, options graphdriver.Appl
 	if d.options.forceMask != nil {
 		st.Mode |= os.ModeDir
 		if err := idtools.SetContainersOverrideXattr(sa.Path, st); err != nil {
-			return t.Cleanup, nil, -1, err
+			if !errors.Is(err, system.ENOTSUP) && !(unshare.IsRootless() && errors.Is(err, syscall.EPERM)) {
+				return t.Cleanup, nil, -1, err
+			}
+			// Ignore xattr errors on filesystems that don't support them (e.g. NFS)
 		}
 	}
 

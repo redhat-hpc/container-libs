@@ -293,7 +293,7 @@ func (d *Driver) createImageFSFromTarballReader(layerID string, diff io.Reader, 
 	}
 	createCommand := d.getTarballCreateCommandTemplate()
 	if createCommand == "" {
-		return fmt.Errorf("createImageFSFromTarballReader: image_fs_type %q does not support tarball input", d.options.imageFSType)
+		return fmt.Errorf("createImageFSFromTarballReader: image_fs_type does not support tarball input: %q", d.options.imageFSType)
 	}
 	logrus.Debugf("overlay: %s: imagefs create command template: %q", context, createCommand)
 	logrus.Debugf("overlay: %s: creating imagefs from tarball stdin, imagePath from template", context)
@@ -339,7 +339,7 @@ func (d *Driver) createImageFSFromTarballReader(layerID string, diff io.Reader, 
 		return fmt.Errorf("executing image create command %q: %s %w", expandedCmd, stderrBuf.String(), err)
 	}
 
-	logrus.Debugf("overlay: %s: successfully created image file at %q from tarball stdin", context, imagePath)
+	logrus.Debugf("overlay: %s: successfully created image file at from tarball stdin: %q", context, imagePath)
 	stat, err := os.Stat(imagePath)
 	if err != nil {
 		return fmt.Errorf("image file was not created at %q: %w", imagePath, err)
@@ -357,7 +357,7 @@ func (d *Driver) createImageFSFromTarball(layerID, tarballPath, context string) 
 	}
 	createCommand := d.getTarballCreateCommandTemplate()
 	if createCommand == "" {
-		return fmt.Errorf("createImageFSFromTarball: image_fs_type %q does not support tarball input", d.options.imageFSType)
+		return fmt.Errorf("createImageFSFromTarball: image_fs_type does not support tarball input: %q", d.options.imageFSType)
 	}
 	logrus.Debugf("overlay: %s: imagefs create command template: %q", context, createCommand)
 
@@ -403,7 +403,7 @@ func (d *Driver) createImageFSFromTarball(layerID, tarballPath, context string) 
 		return fmt.Errorf("executing image create command %q: %s %w", expandedCmd, stderrBuf.String(), err)
 	}
 
-	logrus.Debugf("overlay: %s: successfully created image file at %q from tarball", context, imagePath)
+	logrus.Debugf("overlay: %s: successfully created image file from tarball at %q ", context, imagePath)
 	stat, err := os.Stat(imagePath)
 	if err != nil {
 		return fmt.Errorf("image file was not created at %q: %w", imagePath, err)

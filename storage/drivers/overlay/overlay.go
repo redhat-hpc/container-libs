@@ -1983,7 +1983,7 @@ func (d *Driver) get(id string, disableShifting bool, options graphdriver.MountO
 				if _, err := system.Lgetxattr(diffDir, idtools.ContainersOverrideXattr); err == nil || !errors.Is(err, system.ENOTSUP) {
 					label = label + ",xattr_permissions=2"
 				} else {
-					logrus.Warnf("overlay: skipping xattr_permissions=2 (upperdir %q does not support xattrs)", diffDir)
+					logrus.Warnf("overlay: skipping xattr_permissions=2 (upperdir does not support xattrs: %q)", diffDir)
 				}
 			}
 

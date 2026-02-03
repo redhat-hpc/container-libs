@@ -850,6 +850,34 @@ func GetStore(options types.StoreOptions) (Store, error) {
 		options.RunRoot = defaultOpts.RunRoot
 	}
 
+	// When the caller specified only root path(s) (e.g. podman --root), merge in
+	// the rest of the storage config (driver, driver options, etc.) from the
+	// default config so that storage.conf and CONTAINERS_STORAGE_CONF are honored.
+	if options.GraphDriverName == "" {
+		options.GraphDriverName = defaultOpts.GraphDriverName
+	}
+	if len(options.GraphDriverPriority) == 0 {
+		options.GraphDriverPriority = defaultOpts.GraphDriverPriority
+	}
+	if len(options.GraphDriverOptions) == 0 {
+		options.GraphDriverOptions = defaultOpts.GraphDriverOptions
+	}
+	if options.ImageStore == "" {
+		options.ImageStore = defaultOpts.ImageStore
+	}
+	if options.RootAutoNsUser == "" {
+		options.RootAutoNsUser = defaultOpts.RootAutoNsUser
+	}
+	if options.AutoNsMinSize == 0 {
+		options.AutoNsMinSize = defaultOpts.AutoNsMinSize
+	}
+	if options.AutoNsMaxSize == 0 {
+		options.AutoNsMaxSize = defaultOpts.AutoNsMaxSize
+	}
+	if options.PullOptions == nil {
+		options.PullOptions = defaultOpts.PullOptions
+	}
+
 	if err := os.MkdirAll(options.RunRoot, 0o700); err != nil {
 		return nil, err
 	}

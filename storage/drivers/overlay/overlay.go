@@ -1137,10 +1137,10 @@ func (d *Driver) create(id, parent string, opts *graphdriver.CreateOpts, readOnl
 	if d.options.forceMask != nil {
 		st.Mode |= os.ModeDir
 		if err := idtools.SetContainersOverrideXattr(diff, st); err != nil {
-			if !errors.Is(err, system.ENOTSUP) && !(unshare.IsRootless() && errors.Is(err, syscall.EPERM)) {
+			// For imagefs the diff is only used to build the read-only lower layer blob, so the override xattr isn't needed.
+			if d.options.imageFSType == "" || (!errors.Is(err, system.ENOTSUP) && !(unshare.IsRootless() && errors.Is(err, syscall.EPERM))) {
 				return err
 			}
-			// Ignore xattr errors on filesystems that don't support them (e.g. NFS)
 			logrus.Warnf("overlay: could not set override xattr on layer diff (filesystem may not support xattrs): %v", err)
 		}
 	}
@@ -2565,10 +2565,13 @@ func (d *Driver) StartStagingDiffToApply(parent string, options graphdriver.Appl
 	if d.options.forceMask != nil {
 		st.Mode |= os.ModeDir
 		if err := idtools.SetContainersOverrideXattr(sa.Path, st); err != nil {
+			// Only ignore xattr errors on lower layers when doing imagefs (e.g. NFS staging dirs)
+			if d.options.imageFSType == "" {
+				return t.Cleanup, nil, -1, err
+			}
 			if !errors.Is(err, system.ENOTSUP) && !(unshare.IsRootless() && errors.Is(err, syscall.EPERM)) {
 				return t.Cleanup, nil, -1, err
 			}
-			// Ignore xattr errors on filesystems that don't support them (e.g. NFS)
 		}
 	}
 

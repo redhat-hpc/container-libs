@@ -828,12 +828,13 @@ func (d *Driver) String() string {
 
 // Status returns current driver information in a two dimensional string array.
 // Output contains "Backing Filesystem" used in this implementation.
+// When image_fs_type is set, also reports the selected imagefs template (create command, tool, mount program).
 func (d *Driver) Status() [][2]string {
 	supportsVolatile, err := d.getSupportsVolatile()
 	if err != nil {
 		supportsVolatile = false
 	}
-	return [][2]string{
+	status := [][2]string{
 		{"Backing Filesystem", backingFs},
 		{"Supports d_type", strconv.FormatBool(d.supportsDType)},
 		{"Native Overlay Diff", strconv.FormatBool(!d.useNaiveDiff())},
@@ -841,6 +842,13 @@ func (d *Driver) Status() [][2]string {
 		{"Supports shifting", strconv.FormatBool(d.SupportsShifting(nil, nil))},
 		{"Supports volatile", strconv.FormatBool(supportsVolatile)},
 	}
+	if createCmd, _, mountProg := getImageFSStatusInfo(&d.options); d.options.imageFSType != "" {
+		status = append(status, [2]string{"Imagefs create command", createCmd})
+		if mountProg != "" {
+			status = append(status, [2]string{"Imagefs mount program", mountProg})
+		}
+	}
+	return status
 }
 
 // Metadata returns meta data about the overlay driver such as

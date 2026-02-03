@@ -83,6 +83,23 @@ func validateImageFSConfig(opts *overlayOptions) error {
 	return nil
 }
 
+// getImageFSStatusInfo returns the effective imagefs template info for status display.
+// Returns (createCommandTemplate, toolName, mountProgram). All empty when image_fs_type is not set.
+func getImageFSStatusInfo(opts *overlayOptions) (createCommand, toolName, mountProgram string) {
+	if opts.imageFSType == "" {
+		return "", "", ""
+	}
+	def, ok := imageFSDefaults[opts.imageFSType]
+	if !ok {
+		// Custom type with explicit image_fs_create_command
+		return opts.imageFSCreateCommand, "custom", ""
+	}
+	if opts.imageFSCreateCommand != "" {
+		return opts.imageFSCreateCommand, "custom", def.mountProgram
+	}
+	return def.createFromDir, def.toolName, def.mountProgram
+}
+
 func (d *Driver) maybeAddImageFSMount(id, dir, lowerID string, i int, readWrite, inAdditionalStore bool) (string, error) {
 	logrus.Debugf("overlay: maybeAddImageFSMount called for id=%q, dir=%q, lowerID=%q, i=%d, readWrite=%v", id, dir, lowerID, i, readWrite)
 	if d.options.imageFSType == "" {

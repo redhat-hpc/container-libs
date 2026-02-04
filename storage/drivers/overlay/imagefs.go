@@ -28,76 +28,102 @@ import (
 // erofs tarball when applying a diff without untarring (staging path only).
 const stagingLayerTarballName = "layer.tar"
 
-// imageFSDefault holds default tool name, create command templates, and mount program per image_fs_type.
-// createFromDir is the template for directory input (variables: ImagePath, TmpDir).
-// createFromTarball is the template for tarball input (variables: ImagePath, Tarball); empty if not supported.
+// imageFSDefault holds a single create command template and mount program per image_fs_type.
+// The create command template can use ImagePath, TmpDir (for directory input), and Tarball (path or "-" for stdin).
+// Whether tarball/directory/stdin is used is determined by heuristics on the template (see imageFSSupportsTarball, imageFSTarballWantsStdin, imageFSCreateCommandWantsDirectory).
+// The tool name for validation/display is inferred from the first word of the expanded template when needed.
 // mountProgram is the mount program for rootless (e.g. "erofsfuse"); empty if none or not applicable.
 type imageFSDefault struct {
-	toolName          string
-	createFromDir     string
-	createFromTarball string
-	mountProgram      string
+	createCommand string
+	mountProgram  string
 }
 
 var imageFSDefaults = map[string]imageFSDefault{
 	"erofs": {
-		toolName:          "mkfs.erofs",
-		createFromDir:     "mkfs.erofs -z lz4 {{.ImagePath}} {{.TmpDir}}",
-		createFromTarball: "mkfs.erofs --tar=f -z lz4 {{.ImagePath}} {{.Tarball}}",
-		mountProgram:      "erofsfuse",
+		createCommand: "mkfs.erofs --tar=f -z lz4 {{.ImagePath}} {{.Tarball}}",
+		mountProgram:  "erofsfuse",
 	},
-	// "squashfs": {
-	// 	toolName:          "mksquashfs",
-	// 	createFromDir:     "mksquashfs {{.TmpDir}} {{.ImagePath}}",
-	// 	createFromTarball: "",
-	// 	mountProgram:      "squashfuse",
-	// },
 	"squashfs": {
-		toolName:          "gensquashfs",
-		createFromDir:     "gensquashfs -D {{.TmpDir}} {{.ImagePath}}",
-		createFromTarball: "tar2sqfs {{.ImagePath}}",
-		mountProgram:      "squashfuse",
+		createCommand: "tar2sqfs {{.ImagePath}}",
+		mountProgram:  "squashfuse",
 	},
 }
 
+// imageFSCreateCommandFirstWord expands the create command template with the given vars and returns the first word (tool name).
+// Returns empty string if the template is empty or expansion fails.
+func imageFSCreateCommandFirstWord(createCommand, imagePath, tmpDir, tarball string) string {
+	if createCommand == "" {
+		return ""
+	}
+	tmpl, err := template.New("image_fs_create").Parse(createCommand)
+	if err != nil {
+		return ""
+	}
+	var buf bytes.Buffer
+	data := struct{ ImagePath, TmpDir, Tarball string }{imagePath, tmpDir, tarball}
+	if err := tmpl.Execute(&buf, data); err != nil {
+		return ""
+	}
+	fields := strings.Fields(strings.TrimSpace(buf.String()))
+	if len(fields) == 0 {
+		return ""
+	}
+	return fields[0]
+}
+
 // validateImageFSConfig validates imagefs configuration and checks for required tools.
+// The tool to check is inferred from the first word of the create command template when expanded with placeholder values.
 func validateImageFSConfig(opts *overlayOptions) error {
 	if opts.imageFSType == "" {
 		return nil
 	}
 
-	// If create command is not specified, check if default tool exists
-	if opts.imageFSCreateCommand == "" {
+	createCommand := opts.imageFSCreateCommand
+	if createCommand == "" {
 		def, ok := imageFSDefaults[opts.imageFSType]
 		if !ok {
 			logrus.Errorf("image_fs_type %q requires an image_fs_create_command to be set", opts.imageFSType)
 			return fmt.Errorf("image_fs_type %q requires an image_fs_create_command to be set", opts.imageFSType)
 		}
-		if _, err := exec.LookPath(def.toolName); err != nil {
-			logrus.Errorf("image_fs_type %q requires %s to be available (or set image_fs_create_command)", opts.imageFSType, def.toolName)
-			return fmt.Errorf("image_fs_type %q requires %s to be available (or set image_fs_create_command)", opts.imageFSType, def.toolName)
+		createCommand = def.createCommand
+	}
+
+	// Check tools that may be run: expand with directory input and with tarball input to cover conditional templates.
+	tools := make(map[string]struct{})
+	for _, d := range []struct{ tmpDir, tarball string }{{".", ""}, {"", "-"}} {
+		if name := imageFSCreateCommandFirstWord(createCommand, "/tmp/out", d.tmpDir, d.tarball); name != "" {
+			tools[name] = struct{}{}
 		}
-		logrus.Debugf("overlay: validated default tool %q for image_fs_type %q", def.toolName, opts.imageFSType)
+	}
+	if len(tools) == 0 {
+		logrus.Errorf("image_fs_type %q: could not infer tool from create command", opts.imageFSType)
+		return fmt.Errorf("image_fs_type %q: could not infer tool from create command", opts.imageFSType)
+	}
+	for tool := range tools {
+		if _, err := exec.LookPath(tool); err != nil {
+			logrus.Errorf("image_fs_type %q requires %s to be available (or set image_fs_create_command)", opts.imageFSType, tool)
+			return fmt.Errorf("image_fs_type %q requires %s to be available (or set image_fs_create_command)", opts.imageFSType, tool)
+		}
+		logrus.Debugf("overlay: validated tool %q for image_fs_type %q", tool, opts.imageFSType)
 	}
 
 	return nil
 }
 
-// getImageFSStatusInfo returns the effective imagefs template info for status display.
-// Returns (createCommandTemplate, toolName, mountProgram). All empty when image_fs_type is not set.
-func getImageFSStatusInfo(opts *overlayOptions) (createCommand, toolName, mountProgram string) {
+// getImageFSStatusInfo returns the effective imagefs template and mount program for status display.
+// Returns (createCommandTemplate, mountProgram). All empty when image_fs_type is not set.
+func getImageFSStatusInfo(opts *overlayOptions) (createCommand, mountProgram string) {
 	if opts.imageFSType == "" {
-		return "", "", ""
+		return "", ""
 	}
 	def, ok := imageFSDefaults[opts.imageFSType]
 	if !ok {
-		// Custom type with explicit image_fs_create_command
-		return opts.imageFSCreateCommand, "custom", ""
+		return opts.imageFSCreateCommand, ""
 	}
 	if opts.imageFSCreateCommand != "" {
-		return opts.imageFSCreateCommand, "custom", def.mountProgram
+		return opts.imageFSCreateCommand, def.mountProgram
 	}
-	return def.createFromDir, def.toolName, def.mountProgram
+	return def.createCommand, def.mountProgram
 }
 
 func (d *Driver) maybeAddImageFSMount(id, dir, lowerID string, i int, readWrite, inAdditionalStore bool) (string, error) {
@@ -198,19 +224,15 @@ func (d *Driver) getImageFSData(id string) string {
 }
 
 // createImageFSFromDirectory creates an image filesystem from the contents of a source directory.
-// It uses the image_fs_create_command template with ImagePath and TmpDir variables.
+// It uses the create command template with ImagePath and TmpDir (Tarball empty).
 func (d *Driver) createImageFSFromDirectory(layerID, sourceDir, context string) error {
 	if d.options.imageFSType == "" {
 		return nil
 	}
 
-	createCommand := d.options.imageFSCreateCommand
+	createCommand := d.getCreateCommandTemplate()
 	if createCommand == "" {
-		def, ok := imageFSDefaults[d.options.imageFSType]
-		if !ok || def.createFromDir == "" {
-			return fmt.Errorf("image_fs_type %q requires an image_fs_create_command to be set", d.options.imageFSType)
-		}
-		createCommand = def.createFromDir
+		return fmt.Errorf("image_fs_type %q requires an image_fs_create_command to be set", d.options.imageFSType)
 	}
 	logrus.Debugf("overlay: %s: imagefs create command template: %q", context, createCommand)
 
@@ -223,8 +245,7 @@ func (d *Driver) createImageFSFromDirectory(layerID, sourceDir, context string) 
 		return fmt.Errorf("creating directory for image file: %w", err)
 	}
 
-	// Construct and execute the image creation command using template expansion
-	tmpl, err := template.New("image_fs_create_command").Parse(createCommand)
+	tmpl, err := template.New("image_fs_create").Parse(createCommand)
 	if err != nil {
 		return fmt.Errorf("parsing image_fs_create_command template: %w", err)
 	}
@@ -233,9 +254,11 @@ func (d *Driver) createImageFSFromDirectory(layerID, sourceDir, context string) 
 	templateData := struct {
 		ImagePath string
 		TmpDir    string
+		Tarball   string
 	}{
 		ImagePath: imagePath,
 		TmpDir:    sourceDir,
+		Tarball:   "",
 	}
 	if err = tmpl.Execute(&cmdBuf, templateData); err != nil {
 		return fmt.Errorf("executing image_fs_create_command template: %w", err)
@@ -265,55 +288,62 @@ func (d *Driver) createImageFSFromDirectory(layerID, sourceDir, context string) 
 	return nil
 }
 
-// imageFSSupportsTarball returns true if the default for this image_fs_type has createFromTarball.
-// When true, we use the tarball path (staging tarball or create from tarball); when false, we use create from directory only.
-func (d *Driver) imageFSSupportsTarball() bool {
-	def := imageFSDefaults[d.options.imageFSType]
-	return def.createFromTarball != ""
-}
-
-// getTarballCreateCommandTemplate returns the create command template used for tarball input.
-// Uses image_fs_create_command if set, otherwise the default createFromTarball for the fs type.
-// Returns empty string if the fs type does not support tarball input.
-func (d *Driver) getTarballCreateCommandTemplate() string {
+// getCreateCommandTemplate returns the create command template (custom or default).
+// Template may use ImagePath, TmpDir, and Tarball.
+func (d *Driver) getCreateCommandTemplate() string {
 	if d.options.imageFSCreateCommand != "" {
 		return d.options.imageFSCreateCommand
 	}
 	def := imageFSDefaults[d.options.imageFSType]
-	return def.createFromTarball
+	return def.createCommand
 }
 
-// imageFSTarballWantsStdin returns true if the tarball create command template does not
-// contain {{.Tarball}} or {{.TmpDir}}, meaning the command expects the tarball on stdin.
-func (d *Driver) imageFSTarballWantsStdin() bool {
-	tmpl := d.getTarballCreateCommandTemplate()
+// imageFSSupportsTarball returns true if the create command template accepts tarball input (file path or stdin).
+// Heuristic: template contains {{.Tarball}}; or contains {{else}} (conditional branch for tarball/stdin); or contains neither {{.TmpDir}} nor {{.Tarball}} (stdin-only).
+func (d *Driver) imageFSSupportsTarball() bool {
+	tmpl := d.getCreateCommandTemplate()
 	if tmpl == "" {
 		return false
 	}
-	return !strings.Contains(tmpl, "{{.Tarball}}") && !strings.Contains(tmpl, "{{.TmpDir}}")
+	hasTarball := strings.Contains(tmpl, "{{.Tarball}}")
+	hasTmpDir := strings.Contains(tmpl, "{{.TmpDir}}")
+	hasElse := strings.Contains(tmpl, "{{else}}")
+	return hasTarball || hasElse || (!hasTmpDir && !hasTarball)
+}
+
+// imageFSTarballWantsStdin returns true if tarball input must be streamed via stdin (no file path in template).
+// Heuristic: template has no {{.Tarball}} and either has {{else}} (e.g. tar2sqfs branch) or has neither {{.TmpDir}} nor {{.Tarball}}.
+func (d *Driver) imageFSTarballWantsStdin() bool {
+	tmpl := d.getCreateCommandTemplate()
+	if tmpl == "" {
+		return false
+	}
+	hasTarball := strings.Contains(tmpl, "{{.Tarball}}")
+	hasTmpDir := strings.Contains(tmpl, "{{.TmpDir}}")
+	hasElse := strings.Contains(tmpl, "{{else}}")
+	return !hasTarball && (hasElse || (!hasTmpDir && !hasTarball))
 }
 
 // imageFSCreateCommandWantsDirectory returns true when the create command template
-// contains {{.TmpDir}}, meaning it expects directory input rather than a tarball.
-// When true, applyDiff and commit must use the directory path (untar then create)
-// so that TmpDir is populated and passed correctly.
+// contains {{.TmpDir}}, meaning it expects directory input. When true, applyDiff and
+// commit must use the directory path (untar then create) so that TmpDir is populated.
 func (d *Driver) imageFSCreateCommandWantsDirectory() bool {
-	tmpl := d.getTarballCreateCommandTemplate()
+	tmpl := d.getCreateCommandTemplate()
 	return tmpl != "" && strings.Contains(tmpl, "{{.TmpDir}}")
 }
 
 // createImageFSFromTarballReader creates an image filesystem from a tarball read from stdin.
-// Used when the create command template has no {{.Tarball}} or {{.TmpDir}} (streaming from stdin).
+// Uses the create command template with Tarball="-", TmpDir empty; stdin is connected to the command.
 func (d *Driver) createImageFSFromTarballReader(layerID string, diff io.Reader, context string) error {
 	if d.options.imageFSType == "" {
 		return nil
 	}
-	createCommand := d.getTarballCreateCommandTemplate()
+	createCommand := d.getCreateCommandTemplate()
 	if createCommand == "" {
 		return fmt.Errorf("createImageFSFromTarballReader: image_fs_type does not support tarball input: %q", d.options.imageFSType)
 	}
 	logrus.Debugf("overlay: %s: imagefs create command template: %q", context, createCommand)
-	logrus.Debugf("overlay: %s: creating imagefs from tarball stdin, imagePath from template", context)
+	logrus.Debugf("overlay: %s: creating imagefs from tarball stdin", context)
 
 	imagePath := d.getImageFSData(layerID)
 	imageDir := path.Dir(imagePath)
@@ -321,7 +351,7 @@ func (d *Driver) createImageFSFromTarballReader(layerID string, diff io.Reader, 
 		return fmt.Errorf("creating directory for image file: %w", err)
 	}
 
-	tmpl, err := template.New("image_fs_create_command_tarball_stdin").Parse(createCommand)
+	tmpl, err := template.New("image_fs_create").Parse(createCommand)
 	if err != nil {
 		return fmt.Errorf("parsing image_fs_create_command template: %w", err)
 	}
@@ -329,14 +359,12 @@ func (d *Driver) createImageFSFromTarballReader(layerID string, diff io.Reader, 
 	var cmdBuf bytes.Buffer
 	templateData := struct {
 		ImagePath string
-		ImageDir  string
-		Tarball   string
 		TmpDir    string
+		Tarball   string
 	}{
 		ImagePath: imagePath,
-		ImageDir:  imageDir,
-		Tarball:   "-",
 		TmpDir:    "",
+		Tarball:   "-",
 	}
 	if err = tmpl.Execute(&cmdBuf, templateData); err != nil {
 		return fmt.Errorf("executing image_fs_create_command template: %w", err)
@@ -366,27 +394,25 @@ func (d *Driver) createImageFSFromTarballReader(layerID string, diff io.Reader, 
 }
 
 // createImageFSFromTarball creates an image filesystem directly from a tarball file.
-// Used for fs types that support tarball input (see imageFSDefaults.createFromTarball).
-// The template supports ImagePath, ImageDir, Tarball, and TmpDir variables.
+// Uses the create command template with Tarball set to path, TmpDir empty.
 func (d *Driver) createImageFSFromTarball(layerID, tarballPath, context string) error {
 	if d.options.imageFSType == "" {
 		return nil
 	}
-	createCommand := d.getTarballCreateCommandTemplate()
+	createCommand := d.getCreateCommandTemplate()
 	if createCommand == "" {
 		return fmt.Errorf("createImageFSFromTarball: image_fs_type does not support tarball input: %q", d.options.imageFSType)
 	}
 	logrus.Debugf("overlay: %s: imagefs create command template: %q", context, createCommand)
+	logrus.Debugf("overlay: %s: creating imagefs from tarball, imagePath=%q, tarball=%q", context, d.getImageFSData(layerID), tarballPath)
 
 	imagePath := d.getImageFSData(layerID)
 	imageDir := path.Dir(imagePath)
-	logrus.Debugf("overlay: %s: creating imagefs from tarball, imagePath=%q, tarball=%q", context, imagePath, tarballPath)
-
 	if err := os.MkdirAll(imageDir, 0o755); err != nil {
 		return fmt.Errorf("creating directory for image file: %w", err)
 	}
 
-	tmpl, err := template.New("image_fs_create_command_tarball").Parse(createCommand)
+	tmpl, err := template.New("image_fs_create").Parse(createCommand)
 	if err != nil {
 		return fmt.Errorf("parsing image_fs_create_command template: %w", err)
 	}
@@ -394,14 +420,12 @@ func (d *Driver) createImageFSFromTarball(layerID, tarballPath, context string) 
 	var cmdBuf bytes.Buffer
 	templateData := struct {
 		ImagePath string
-		ImageDir  string
-		Tarball   string
 		TmpDir    string
+		Tarball   string
 	}{
 		ImagePath: imagePath,
-		ImageDir:  imageDir,
-		Tarball:   tarballPath,
 		TmpDir:    "",
+		Tarball:   tarballPath,
 	}
 	if err = tmpl.Execute(&cmdBuf, templateData); err != nil {
 		return fmt.Errorf("executing image_fs_create_command template: %w", err)
@@ -447,7 +471,7 @@ func (d *Driver) applyDiffForImageFS(target string, options graphdriver.ApplyDif
 		}
 	}
 
-	// If the default for this fs type has createFromTarball, write the diff as a staging tarball.
+	// If this fs type supports tarball input, write the diff as a staging tarball.
 	if isStagingDir && d.imageFSSupportsTarball() {
 		tarballPath := filepath.Join(target, stagingLayerTarballName)
 		f, err := os.Create(tarballPath)
@@ -509,7 +533,7 @@ func (d *Driver) applyDiffForImageFS(target string, options graphdriver.ApplyDif
 		return stat.Size(), true, nil
 	}
 
-	// If the default for this fs type has createFromTarball, create from tarball (stdin or temp file).
+	// If this fs type supports tarball input, create from tarball (stdin or temp file).
 	if d.imageFSSupportsTarball() {
 		if d.imageFSTarballWantsStdin() {
 			if err := d.createImageFSFromTarballReader(layerID, options.Diff, "applyDiff"); err != nil {
@@ -546,7 +570,7 @@ func (d *Driver) applyDiffForImageFS(target string, options graphdriver.ApplyDif
 		return stat.Size(), true, nil
 	}
 
-	// Default has no createFromTarball: untar into tmp dir, then create image from directory.
+	// Fs type does not support tarball input: untar into tmp dir, then create image from directory.
 	tmpDir, err := os.MkdirTemp(d.home, fmt.Sprintf("%s-apply-diff-", d.options.imageFSType))
 	if err != nil {
 		return 0, false, fmt.Errorf("creating temporary directory for %s diff: %w", d.options.imageFSType, err)
@@ -578,7 +602,7 @@ func (d *Driver) applyDiffForImageFS(target string, options graphdriver.ApplyDif
 
 // commitStagedLayerForImageFS creates the image filesystem from the staging directory (or tarball)
 // and removes the staging directory. Caller must ensure d.options.imageFSType != "".
-// If the default has createFromTarball and a staging tarball exists, create from tarball (stdin or file path); otherwise create from directory.
+// If the fs type supports tarball input and a staging tarball exists, create from tarball (stdin or file path); otherwise create from directory.
 func (d *Driver) commitStagedLayerForImageFS(id, stagingPath, applyDir string) error {
 	tarballPath := filepath.Join(stagingPath, stagingLayerTarballName)
 	hasStagingTarball := false
@@ -624,7 +648,7 @@ func (d *Driver) commitStagedLayerForImageFS(id, stagingPath, applyDir string) e
 			}
 		}
 	} else {
-		// No staging tarball, or fs type has no createFromTarball: stagingPath is the directory.
+		// No staging tarball, or fs type does not support tarball input: stagingPath is the directory.
 		if err := d.createImageFSFromDirectory(id, stagingPath, "CommitStagedLayer"); err != nil {
 			return err
 		}

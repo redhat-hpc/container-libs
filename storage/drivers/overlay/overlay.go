@@ -842,7 +842,7 @@ func (d *Driver) Status() [][2]string {
 		{"Supports shifting", strconv.FormatBool(d.SupportsShifting(nil, nil))},
 		{"Supports volatile", strconv.FormatBool(supportsVolatile)},
 	}
-	if createCmd, _, mountProg := getImageFSStatusInfo(&d.options); d.options.imageFSType != "" {
+	if createCmd, mountProg := getImageFSStatusInfo(&d.options); d.options.imageFSType != "" {
 		status = append(status, [2]string{"Imagefs create command", createCmd})
 		if mountProg != "" {
 			status = append(status, [2]string{"Imagefs mount program", mountProg})

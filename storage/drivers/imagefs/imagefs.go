@@ -4,13 +4,17 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 
+	"github.com/sirupsen/logrus"
 	graphdriver "go.podman.io/storage/drivers"
 	"go.podman.io/storage/internal/tempdir"
 	"go.podman.io/storage/pkg/archive"
 	"go.podman.io/storage/pkg/directory"
 	"go.podman.io/storage/pkg/idtools"
+	"go.podman.io/storage/pkg/mount"
 )
 
 func init() {
@@ -18,20 +22,31 @@ func init() {
 }
 
 // Init returns a new ImageFS driver.
-// This is a stub implementation that provides the basic structure
-// without performing actual I/O operations.
 func Init(home string, options graphdriver.Options) (graphdriver.Driver, error) {
 	opts, err := parseOptions(options.DriverOptions)
 	if err != nil {
 		return nil, err
 	}
 
-	_ = opts // Use options in future implementation
+	// Validate that the required conversion tool is present
+	var tool string
+	switch opts.Format {
+	case FormatEROFS:
+		tool = "mkfs.erofs"
+	case FormatSquashFS:
+		tool = "tar2sqfs"
+	}
+
+	if _, err := exec.LookPath(tool); err != nil {
+		return nil, fmt.Errorf("imagefs: required tool %q not found in PATH: %w", tool, err)
+	}
+	logrus.Infof("imagefs: driver initialized with format %q using tool %q", opts.Format, tool)
 
 	d := &ImageFS{
 		name:       "imagefs",
 		home:       home,
 		imageStore: options.ImageStore,
+		options:    opts,
 	}
 
 	// Create the driver home directory structure
@@ -46,13 +61,12 @@ func Init(home string, options graphdriver.Options) (graphdriver.Driver, error) 
 	return d, nil
 }
 
-// ImageFS is a stub storage driver for image file system operations.
-// This driver implements the graphdriver.Driver interface but all methods
-// currently return "not yet implemented" errors.
+// ImageFS is a storage driver for image file system operations.
 type ImageFS struct {
 	name              string
 	home              string
 	imageStore        string
+	options           *Options
 	naiveDiff         graphdriver.DiffDriver
 	updater           graphdriver.LayerIDMapUpdater
 	ignoreChownErrors bool
@@ -70,9 +84,29 @@ func (d *ImageFS) Status() [][2]string {
 }
 
 // Metadata returns metadata for the specified layer ID.
-// Currently returns nil metadata as no actual storage is managed.
 func (d *ImageFS) Metadata(id string) (map[string]string, error) {
-	return nil, nil //nolint: nilnil
+	var ext string
+	switch d.options.Format {
+	case FormatEROFS:
+		ext = ".erofs"
+	case FormatSquashFS:
+		ext = ".sqsh"
+	default:
+		return nil, fmt.Errorf("imagefs: unsupported format %q", d.options.Format)
+	}
+
+	path := filepath.Join(d.home, "layers", id+ext)
+	if _, err := os.Stat(path); err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	return map[string]string{
+		"format": d.options.Format,
+		"path":   path,
+	}, nil
 }
 
 // Cleanup performs any necessary cleanup tasks.
@@ -82,33 +116,99 @@ func (d *ImageFS) Cleanup() error {
 }
 
 // CreateReadWrite creates a new read-write layer with the specified ID and parent.
-// Returns an error indicating this method is not yet implemented.
 func (d *ImageFS) CreateReadWrite(id, parent string, opts *graphdriver.CreateOpts) error {
-	return fmt.Errorf("imagefs: CreateReadWrite not yet implemented")
+	return fmt.Errorf("imagefs: read-write layers are not supported by this driver")
 }
 
 // Create creates a new layer with the specified ID and parent.
-// Returns an error indicating this method is not yet implemented.
 func (d *ImageFS) Create(id, parent string, opts *graphdriver.CreateOpts) error {
-	return fmt.Errorf("imagefs: Create not yet implemented")
+	// For imagefs, the layer file is created during ApplyDiff.
+	// We don't need to do anything here.
+	return nil
 }
 
 // CreateFromTemplate creates a layer with the same contents as a template layer.
-// Returns an error indicating this method is not yet implemented.
 func (d *ImageFS) CreateFromTemplate(id, template string, templateIDMappings *idtools.IDMappings, parent string, parentIDMappings *idtools.IDMappings, opts *graphdriver.CreateOpts, readWrite bool) error {
-	return fmt.Errorf("imagefs: CreateFromTemplate not yet implemented")
+	if readWrite {
+		return fmt.Errorf("imagefs: read-write layers are not supported")
+	}
+
+	var ext string
+	switch d.options.Format {
+	case FormatEROFS:
+		ext = ".erofs"
+	case FormatSquashFS:
+		ext = ".sqsh"
+	default:
+		return fmt.Errorf("imagefs: unsupported format %q", d.options.Format)
+	}
+
+	src := filepath.Join(d.home, "layers", template+ext)
+	dst := filepath.Join(d.home, "layers", id+ext)
+
+	if _, err := os.Stat(src); err != nil {
+		return fmt.Errorf("imagefs: template layer %s not found: %w", template, err)
+	}
+
+	// Copy the binary image file
+	logrus.Debugf("imagefs: creating layer %s from template %s", id, template)
+	input, err := os.Open(src)
+	if err != nil {
+		return fmt.Errorf("imagefs: failed to open template image: %w", err)
+	}
+	defer input.Close()
+
+	output, err := os.Create(dst + ".tmp")
+	if err != nil {
+		return fmt.Errorf("imagefs: failed to create tmp image for template: %w", err)
+	}
+	tmpName := dst + ".tmp"
+	defer os.Remove(tmpName)
+
+	if _, err := io.Copy(output, input); err != nil {
+		output.Close()
+		return fmt.Errorf("imagefs: failed to copy template image: %w", err)
+	}
+	output.Close()
+
+	if err := os.Rename(tmpName, dst); err != nil {
+		return fmt.Errorf("imagefs: failed to rename template image: %w", err)
+	}
+
+	return nil
 }
 
 // Remove attempts to remove the layer with the specified ID.
-// Returns an error indicating this method is not yet implemented.
 func (d *ImageFS) Remove(id string) error {
-	return fmt.Errorf("imagefs: Remove not yet implemented")
+	var ext string
+	switch d.options.Format {
+	case FormatEROFS:
+		ext = ".erofs"
+	case FormatSquashFS:
+		ext = ".sqsh"
+	default:
+		return fmt.Errorf("imagefs: unsupported format %q", d.options.Format)
+	}
+
+	path := filepath.Join(d.home, "layers", id+ext)
+	logrus.Debugf("imagefs: removing layer image %s", path)
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("imagefs: failed to remove layer %s: %w", id, err)
+	}
+	return nil
 }
 
 // DeferredRemove is used to remove the layer with the specified ID.
-// Returns an error indicating this method is not yet implemented.
 func (d *ImageFS) DeferredRemove(id string) (tempdir.CleanupTempDirFunc, error) {
-	return nil, fmt.Errorf("imagefs: DeferredRemove not yet implemented")
+	// For imagefs, removal is simple and doesn't require a complex deferred cleanup
+	// like overlay/vfs might. We can just call Remove and return a no-op cleanup.
+	if err := d.Remove(id); err != nil {
+		return nil, err
+	}
+	return func() error {
+		// No additional cleanup needed for binary image files
+		return nil
+	}, nil
 }
 
 // GetTempDirRootDirs returns the root directories for temporary directories.
@@ -118,27 +218,100 @@ func (d *ImageFS) GetTempDirRootDirs() []string {
 }
 
 // Get returns the mount point for the layered filesystem referred to by the ID.
-// Returns an error indicating this method is not yet implemented.
 func (d *ImageFS) Get(id string, options graphdriver.MountOpts) (string, error) {
-	return "", fmt.Errorf("imagefs: Get not yet implemented")
+	var ext, fsType string
+	switch d.options.Format {
+	case FormatEROFS:
+		ext = ".erofs"
+		fsType = "erofs"
+	case FormatSquashFS:
+		ext = ".sqsh"
+		fsType = "squashfs"
+	default:
+		return "", fmt.Errorf("imagefs: unsupported format %q", d.options.Format)
+	}
+
+	imagePath := filepath.Join(d.home, "layers", id+ext)
+	if !d.Exists(id) {
+		return "", fmt.Errorf("imagefs: layer %s does not exist", id)
+	}
+
+	mountPoint := filepath.Join(d.home, "mounts", id)
+	if err := os.MkdirAll(mountPoint, 0o755); err != nil {
+		return "", fmt.Errorf("imagefs: failed to create mount point %s: %w", mountPoint, err)
+	}
+
+	// We use the 'mount' command because it handles loop device allocation automatically.
+	// The unix.Mount system call does not.
+	cmd := exec.Command("mount", "-t", fsType, "-o", "loop", imagePath, mountPoint)
+	logrus.Debugf("imagefs: mounting image %s to %s using %s", imagePath, mountPoint, fsType)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return "", fmt.Errorf("imagefs: failed to mount image %s to %s: %s: %w", imagePath, mountPoint, string(output), err)
+	}
+
+	return mountPoint, nil
 }
 
 // Put releases the system resources for the specified ID.
-// Returns an error indicating this method is not yet implemented.
 func (d *ImageFS) Put(id string) error {
-	return fmt.Errorf("imagefs: Put not yet implemented")
+	mountPoint := filepath.Join(d.home, "mounts", id)
+
+	logrus.Debugf("imagefs: unmounting image from %s", mountPoint)
+	// Use the package mount helper to unmount
+	if err := mount.Unmount(mountPoint); err != nil {
+		// If it's not mounted, we can ignore the error
+		return nil
+	}
+
+	if err := os.RemoveAll(mountPoint); err != nil {
+		return fmt.Errorf("imagefs: failed to remove mount point %s: %w", mountPoint, err)
+	}
+
+	return nil
 }
 
 // Exists checks whether a layer with the specified ID exists.
-// Currently returns false as no actual storage is managed.
 func (d *ImageFS) Exists(id string) bool {
-	return false
+	var ext string
+	switch d.options.Format {
+	case FormatEROFS:
+		ext = ".erofs"
+	case FormatSquashFS:
+		ext = ".sqsh"
+	default:
+		return false
+	}
+
+	path := filepath.Join(d.home, "layers", id+ext)
+	_, err := os.Stat(path)
+	return err == nil
 }
 
 // ListLayers returns a list of layer IDs that exist on this driver.
-// Currently returns an empty list as no actual storage is managed.
 func (d *ImageFS) ListLayers() ([]string, error) {
-	return nil, nil
+	var ext string
+	switch d.options.Format {
+	case FormatEROFS:
+		ext = ".erofs"
+	case FormatSquashFS:
+		ext = ".sqsh"
+	default:
+		return nil, fmt.Errorf("imagefs: unsupported format %q", d.options.Format)
+	}
+
+	layersDir := filepath.Join(d.home, "layers")
+	entries, err := os.ReadDir(layersDir)
+	if err != nil {
+		return nil, fmt.Errorf("imagefs: failed to read layers directory: %w", err)
+	}
+
+	var layers []string
+	for _, entry := range entries {
+		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ext) {
+			layers = append(layers, strings.TrimSuffix(entry.Name(), ext))
+		}
+	}
+	return layers, nil
 }
 
 // ReadWriteDiskUsage returns the disk usage of the writable directory for the specified ID.
@@ -172,9 +345,66 @@ func (d *ImageFS) Changes(id string, idMappings *idtools.IDMappings, parent stri
 }
 
 // ApplyDiff extracts the changeset from the given diff into the layer with the specified ID.
-// Returns an error indicating this method is not yet implemented.
 func (d *ImageFS) ApplyDiff(id string, options graphdriver.ApplyDiffOpts) (size int64, err error) {
-	return 0, fmt.Errorf("imagefs: ApplyDiff not yet implemented")
+	var ext string
+	var tool string
+	var args []string
+
+	switch d.options.Format {
+	case FormatEROFS:
+		ext = ".erofs"
+		tool = "mkfs.erofs"
+	case FormatSquashFS:
+		ext = ".sqsh"
+		tool = "tar2sqfs"
+	default:
+		return 0, fmt.Errorf("imagefs: unsupported format %q", d.options.Format)
+	}
+
+	finalPath := filepath.Join(d.home, "layers", id+ext)
+	tmpImgPath := finalPath + ".tmp"
+
+	// Create a temporary tarball file since the tools typically require a file input
+	tmpTarFile, err := os.CreateTemp("", "imagefs-tar-*.tar")
+	if err != nil {
+		return 0, fmt.Errorf("imagefs: failed to create temp tar file: %w", err)
+	}
+	tmpTarName := tmpTarFile.Name()
+	defer os.Remove(tmpTarName)
+	defer tmpTarFile.Close()
+
+	if _, err := io.Copy(tmpTarFile, options.Diff); err != nil {
+		return 0, fmt.Errorf("imagefs: failed to write diff to temp tar file: %w", err)
+	}
+	tmpTarFile.Close()
+
+	// Prepare tool arguments
+	if d.options.Format == FormatEROFS {
+		args = []string{"--tar=f", "-zlz4", tmpImgPath, tmpTarName}
+	} else {
+		args = []string{"-f", tmpTarName, tmpImgPath}
+	}
+
+	logrus.Debugf("imagefs: converting tarball to %s image using %s %v", d.options.Format, tool, args)
+	cmd := exec.Command(tool, args...)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		os.Remove(tmpImgPath)
+		return 0, fmt.Errorf("imagefs: conversion tool %q failed: %s: %w", tool, string(output), err)
+	}
+
+	// Atomic write: rename tmp image to final image
+	if err := os.Rename(tmpImgPath, finalPath); err != nil {
+		os.Remove(tmpImgPath)
+		return 0, fmt.Errorf("imagefs: failed to rename tmp image to final path: %w", err)
+	}
+
+	// Get the size of the created image
+	fi, err := os.Stat(finalPath)
+	if err != nil {
+		return 0, fmt.Errorf("imagefs: failed to stat created image: %w", err)
+	}
+
+	return fi.Size(), nil
 }
 
 // DiffSize calculates the changes between the specified ID and its parent.

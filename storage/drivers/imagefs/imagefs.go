@@ -364,29 +364,20 @@ func (d *ImageFS) ApplyDiff(id string, options graphdriver.ApplyDiffOpts) (size 
 	finalPath := filepath.Join(d.home, "layers", id+ext)
 	tmpImgPath := finalPath + ".tmp"
 
-	// Create a temporary tarball file since the tools typically require a file input
-	tmpTarFile, err := os.CreateTemp("", "imagefs-tar-*.tar")
-	if err != nil {
-		return 0, fmt.Errorf("imagefs: failed to create temp tar file: %w", err)
-	}
-	tmpTarName := tmpTarFile.Name()
-	defer os.Remove(tmpTarName)
-	defer tmpTarFile.Close()
-
-	if _, err := io.Copy(tmpTarFile, options.Diff); err != nil {
-		return 0, fmt.Errorf("imagefs: failed to write diff to temp tar file: %w", err)
-	}
-	tmpTarFile.Close()
-
-	// Prepare tool arguments
+	// Prepare tool arguments. Both tools support reading the tarball from stdin
+	// if the input file path is omitted.
 	if d.options.Format == FormatEROFS {
-		args = []string{"--tar=f", "-zlz4", tmpImgPath, tmpTarName}
+		// --tar=f tells mkfs.erofs to read from stdin.
+		args = []string{"--tar=f", "-zlz4", tmpImgPath}
 	} else {
-		args = []string{"-f", tmpTarName, tmpImgPath}
+		// For tar2sqfs, omitting the input file makes it read from stdin.
+		args = []string{"-f", tmpImgPath}
 	}
 
 	logrus.Debugf("imagefs: converting tarball to %s image using %s %v", d.options.Format, tool, args)
 	cmd := exec.Command(tool, args...)
+	cmd.Stdin = options.Diff
+
 	if output, err := cmd.CombinedOutput(); err != nil {
 		os.Remove(tmpImgPath)
 		return 0, fmt.Errorf("imagefs: conversion tool %q failed: %s: %w", tool, string(output), err)

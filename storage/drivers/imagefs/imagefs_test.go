@@ -5,87 +5,98 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
 	graphdriver "go.podman.io/storage/drivers"
 )
 
-// TestImageFSInitFailure tests that the imagefs driver fails to initialize when tools are missing.
-func TestImageFSInitFailure(t *testing.T) {
-	tempDir, err := os.MkdirTemp("", "imagefs-init-fail-*")
-	if err != nil {
-		t.Fatalf("Failed to create temp dir: %v", err)
-	}
-	defer os.RemoveAll(tempDir)
-
-	opts := graphdriver.Options{
-		Root:    tempDir,
-		RunRoot: filepath.Join(tempDir, "run"),
-	}
-
-	// Since mkfs.erofs/tar2sqfs are likely missing in the test environment,
-	// this should fail.
-	driver, err := Init(filepath.Join(tempDir, "imagefs"), opts)
-	if err == nil {
-		t.Errorf("Expected error due to missing tools, but got nil. Driver: %v", driver)
-	}
+type MockMounter struct {
+	mock.Mock
 }
 
-// TestImageFSBasicOperations tests the logic of the driver without requiring external tools.
-func TestImageFSBasicOperations(t *testing.T) {
-	tempDir, err := os.MkdirTemp("", "imagefs-basic-*")
-	if err != nil {
-		t.Fatalf("Failed to create temp dir: %v", err)
-	}
-	defer os.RemoveAll(tempDir)
+func (m *MockMounter) Mount(source, target, fsType, options string) error {
+	args := m.Called(source, target, fsType, options)
+	return args.Error(0)
+}
 
-	// We create a manual ImageFS instance to bypass the tool check in Init.
-	d := &ImageFS{
-		name:    "imagefs",
-		home:    filepath.Join(tempDir, "imagefs"),
-		options: &Options{Format: FormatEROFS},
-	}
-	os.MkdirAll(filepath.Join(d.home, "layers"), 0o700)
+func (m *MockMounter) Unmount(target string) error {
+	args := m.Called(target)
+	return args.Error(0)
+}
 
-	layerID := "test-layer"
-	layerPath := filepath.Join(d.home, "layers", layerID+".erofs")
+func (m *MockMounter) RunCommand(name string, args ...string) error {
+	// We use a slice for the call to match how we pass arguments in the mock
+	argsSlice := make([]string, 0, len(args)+1)
+	argsSlice = append(argsSlice, name)
+	argsSlice = append(argsSlice, args...)
+	
+	mCalled := m.Called(argsSlice)
+	return mCalled.Error(0)
+}
 
-	// Test Exists (should be false)
-	if d.Exists(layerID) {
-		t.Errorf("Expected layer %s to not exist", layerID)
-	}
-
-	// Create a dummy file to simulate a layer
-	if err := os.WriteFile(layerPath, []byte("dummy content"), 0644); err != nil {
-		t.Fatalf("Failed to create dummy layer file: %v", err)
-	}
-
-	// Test Exists (should be true)
-	if !d.Exists(layerID) {
-		t.Errorf("Expected layer %s to exist", layerID)
-	}
-
-	// Test ListLayers
-	layers, err := d.ListLayers()
-	if err != nil {
-		t.Fatalf("ListLayers failed: %v", err)
-	}
-	if len(layers) != 1 || layers[0] != layerID {
-		t.Errorf("Expected layers [%s], got %v", layerID, layers)
+func TestDriver_Get(t *testing.T) {
+	tmpDir := t.TempDir()
+	runRoot := t.TempDir()
+	
+	mockMounter := new(MockMounter)
+	d := &Driver{
+		home:    tmpDir,
+		runRoot: runRoot,
+		mm: &MountManager{
+			runRoot: runRoot,
+			mounter: mockMounter,
+		},
 	}
 
-	// Test Metadata
-	meta, err := d.Metadata(layerID)
-	if err != nil {
-		t.Fatalf("Metadata failed: %v", err)
-	}
-	if meta["format"] != FormatEROFS {
-		t.Errorf("Expected format %s, got %s", FormatEROFS, meta["format"])
+	// Setup layers: L1 -> L2 -> L3 (L3 is the top)
+	layers := []string{"L1", "L2", "L3"}
+	for i, l := range layers {
+		dir := filepath.Join(tmpDir, l)
+		os.MkdirAll(dir, 0755)
+		if i < len(layers)-1 {
+			os.WriteFile(filepath.Join(dir, "parent"), []byte(layers[i+1]), 0644)
+		}
+		// Create dummy image file
+		os.WriteFile(filepath.Join(tmpDir, l+".img"), []byte("dummy"), 0644)
 	}
 
-	// Test Remove
-	if err := d.Remove(layerID); err != nil {
-		t.Fatalf("Remove failed: %v", err)
+	// Mock mount calls for each layer
+	// Use mock.Anything for options because they might vary (nodev,nosuid)
+	mockMounter.On("Mount", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Maybe().Return(nil)
+	mockMounter.On("RunCommand", mock.Anything).Maybe().Return(nil)
+	
+	// Mock the final overlay mount
+	mockMounter.On("Mount", "overlay", mock.Anything, "overlay", mock.Anything).Return(nil)
+
+	mergedDir, err := d.Get("L1", graphdriver.MountOpts{})
+	assert.NoError(t, err)
+	assert.Contains(t, mergedDir, "merged")
+	
+	mockMounter.AssertExpectations(t)
+}
+
+func TestDriver_Put(t *testing.T) {
+	tmpDir := t.TempDir()
+	runRoot := t.TempDir()
+	
+	mockMounter := new(MockMounter)
+	d := &Driver{
+		home:    tmpDir,
+		runRoot: runRoot,
+		mm: &MountManager{
+			runRoot: runRoot,
+			mounter: mockMounter,
+		},
 	}
-	if d.Exists(layerID) {
-		t.Errorf("Expected layer %s to be removed", layerID)
-	}
+
+	// Setup dummy merged dir
+	mergedDir := filepath.Join(tmpDir, "L1", "merged")
+	os.MkdirAll(mergedDir, 0755)
+
+	mockMounter.On("Unmount", mergedDir).Return(nil)
+
+	err := d.Put("L1")
+	assert.NoError(t, err)
+	
+	mockMounter.AssertExpectations(t)
 }

@@ -1,6 +1,7 @@
 package imagefs
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"os"
@@ -13,405 +14,366 @@ import (
 	"go.podman.io/storage/internal/tempdir"
 	"go.podman.io/storage/pkg/archive"
 	"go.podman.io/storage/pkg/directory"
+	"go.podman.io/storage/pkg/fileutils"
 	"go.podman.io/storage/pkg/idtools"
-	"go.podman.io/storage/pkg/mount"
 )
+
+type Driver struct {
+	home    string
+	runRoot string
+	options Options
+	mm      *MountManager
+}
+
+func Init(home string, options graphdriver.Options) (graphdriver.Driver, error) {
+	return &Driver{
+		home:    home,
+		runRoot: options.RunRoot,
+		options: Options{Format: FormatEROFS},
+		mm:      NewMountManager(options.RunRoot),
+	}, nil
+}
 
 func init() {
 	graphdriver.MustRegister("imagefs", Init)
 }
 
-// Init returns a new ImageFS driver.
-func Init(home string, options graphdriver.Options) (graphdriver.Driver, error) {
-	opts, err := parseOptions(options.DriverOptions)
-	if err != nil {
-		return nil, err
-	}
+// --- ProtoDriver implementation ---
 
-	// Validate that the required conversion tool is present
-	var tool string
-	switch opts.Format {
-	case FormatEROFS:
-		tool = "mkfs.erofs"
-	case FormatSquashFS:
-		tool = "tar2sqfs"
-	}
-
-	if _, err := exec.LookPath(tool); err != nil {
-		return nil, fmt.Errorf("imagefs: required tool %q not found in PATH: %w", tool, err)
-	}
-	logrus.Infof("imagefs: driver initialized with format %q using tool %q", opts.Format, tool)
-
-	d := &ImageFS{
-		name:       "imagefs",
-		home:       home,
-		imageStore: options.ImageStore,
-		options:    opts,
-	}
-
-	// Create the driver home directory structure
-	if err := os.MkdirAll(filepath.Join(home, "layers"), 0o700); err != nil {
-		return nil, err
-	}
-
-	// Initialize the naive diff driver wrapper
-	d.updater = graphdriver.NewNaiveLayerIDMapUpdater(d)
-	d.naiveDiff = graphdriver.NewNaiveDiffDriver(d, d.updater)
-
-	return d, nil
+func (d *Driver) String() string {
+	return "imagefs"
 }
 
-// ImageFS is a storage driver for image file system operations.
-type ImageFS struct {
-	name              string
-	home              string
-	imageStore        string
-	options           *Options
-	naiveDiff         graphdriver.DiffDriver
-	updater           graphdriver.LayerIDMapUpdater
-	ignoreChownErrors bool
-}
-
-// String returns a string representation of this driver.
-func (d *ImageFS) String() string {
-	return d.name
-}
-
-// Status returns status information for the driver.
-// Currently returns empty status as no actual storage is managed.
-func (d *ImageFS) Status() [][2]string {
-	return nil
-}
-
-// Metadata returns metadata for the specified layer ID.
-func (d *ImageFS) Metadata(id string) (map[string]string, error) {
-	var ext string
-	switch d.options.Format {
-	case FormatEROFS:
-		ext = ".erofs"
-	case FormatSquashFS:
-		ext = ".sqsh"
-	default:
-		return nil, fmt.Errorf("imagefs: unsupported format %q", d.options.Format)
+func (d *Driver) CreateReadWrite(id, parent string, opts *graphdriver.CreateOpts) error {
+	// For imagefs, we just need to ensure the directory for the writable layer exists.
+	// The actual layering happens at mount time.
+	dir := d.dir(id)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return fmt.Errorf("failed to create directory %s: %w", dir, err)
 	}
-
-	path := filepath.Join(d.home, "layers", id+ext)
-	if _, err := os.Stat(path); err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
+	if parent != "" {
+		if err := os.WriteFile(filepath.Join(dir, "parent"), []byte(parent), 0644); err != nil {
+			return fmt.Errorf("failed to write parent file: %w", err)
 		}
-		return nil, err
 	}
-
-	return map[string]string{
-		"format": d.options.Format,
-		"path":   path,
-	}, nil
-}
-
-// Cleanup performs any necessary cleanup tasks.
-// Currently a no-op as the stub driver doesn't hold resources.
-func (d *ImageFS) Cleanup() error {
 	return nil
 }
 
-// CreateReadWrite creates a new read-write layer with the specified ID and parent.
-func (d *ImageFS) CreateReadWrite(id, parent string, opts *graphdriver.CreateOpts) error {
-	return fmt.Errorf("imagefs: read-write layers are not supported by this driver")
-}
-
-// Create creates a new layer with the specified ID and parent.
-func (d *ImageFS) Create(id, parent string, opts *graphdriver.CreateOpts) error {
-	// For imagefs, the layer file is created during ApplyDiff.
-	// We don't need to do anything here.
+func (d *Driver) Create(id, parent string, opts *graphdriver.CreateOpts) error {
+	// In imagefs, RO layers are assumed to be .img or .sqsh files in the home directory.
+	// We create a directory for metadata.
+	dir := d.dir(id)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return fmt.Errorf("failed to create directory %s: %w", dir, err)
+	}
+	if parent != "" {
+		if err := os.WriteFile(filepath.Join(dir, "parent"), []byte(parent), 0644); err != nil {
+			return fmt.Errorf("failed to write parent file: %w", err)
+		}
+	}
 	return nil
 }
 
-// CreateFromTemplate creates a layer with the same contents as a template layer.
-func (d *ImageFS) CreateFromTemplate(id, template string, templateIDMappings *idtools.IDMappings, parent string, parentIDMappings *idtools.IDMappings, opts *graphdriver.CreateOpts, readWrite bool) error {
-	if readWrite {
-		return fmt.Errorf("imagefs: read-write layers are not supported")
-	}
+func (d *Driver) CreateFromTemplate(id, template string, templateIDMappings *idtools.IDMappings, parent string, parentIDMappings *idtools.IDMappings, opts *graphdriver.CreateOpts, readWrite bool) error {
+	return fmt.Errorf("CreateFromTemplate not implemented")
+}
 
-	var ext string
-	switch d.options.Format {
-	case FormatEROFS:
-		ext = ".erofs"
-	case FormatSquashFS:
-		ext = ".sqsh"
-	default:
-		return fmt.Errorf("imagefs: unsupported format %q", d.options.Format)
-	}
-
-	src := filepath.Join(d.home, "layers", template+ext)
-	dst := filepath.Join(d.home, "layers", id+ext)
-
-	if _, err := os.Stat(src); err != nil {
-		return fmt.Errorf("imagefs: template layer %s not found: %w", template, err)
-	}
-
-	// Copy the binary image file
-	logrus.Debugf("imagefs: creating layer %s from template %s", id, template)
-	input, err := os.Open(src)
+func (d *Driver) Remove(id string) error {
+	cleanup, err := d.DeferredRemove(id)
 	if err != nil {
-		return fmt.Errorf("imagefs: failed to open template image: %w", err)
+		return err
 	}
-	defer input.Close()
-
-	output, err := os.Create(dst + ".tmp")
-	if err != nil {
-		return fmt.Errorf("imagefs: failed to create tmp image for template: %w", err)
-	}
-	tmpName := dst + ".tmp"
-	defer os.Remove(tmpName)
-
-	if _, err := io.Copy(output, input); err != nil {
-		output.Close()
-		return fmt.Errorf("imagefs: failed to copy template image: %w", err)
-	}
-	output.Close()
-
-	if err := os.Rename(tmpName, dst); err != nil {
-		return fmt.Errorf("imagefs: failed to rename template image: %w", err)
-	}
-
-	return nil
+	return cleanup()
 }
 
-// Remove attempts to remove the layer with the specified ID.
-func (d *ImageFS) Remove(id string) error {
-	var ext string
-	switch d.options.Format {
-	case FormatEROFS:
-		ext = ".erofs"
-	case FormatSquashFS:
-		ext = ".sqsh"
-	default:
-		return fmt.Errorf("imagefs: unsupported format %q", d.options.Format)
-	}
-
-	path := filepath.Join(d.home, "layers", id+ext)
-	logrus.Debugf("imagefs: removing layer image %s", path)
-	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("imagefs: failed to remove layer %s: %w", id, err)
-	}
-	return nil
-}
-
-// DeferredRemove is used to remove the layer with the specified ID.
-func (d *ImageFS) DeferredRemove(id string) (tempdir.CleanupTempDirFunc, error) {
-	// For imagefs, removal is simple and doesn't require a complex deferred cleanup
-	// like overlay/vfs might. We can just call Remove and return a no-op cleanup.
-	if err := d.Remove(id); err != nil {
-		return nil, err
-	}
+func (d *Driver) DeferredRemove(id string) (tempdir.CleanupTempDirFunc, error) {
+	dir := d.dir(id)
 	return func() error {
-		// No additional cleanup needed for binary image files
-		return nil
+		return os.RemoveAll(dir)
 	}, nil
 }
 
-// GetTempDirRootDirs returns the root directories for temporary directories.
-// Currently returns an empty slice as no temp directories are managed.
-func (d *ImageFS) GetTempDirRootDirs() []string {
-	return []string{}
+func (d *Driver) GetTempDirRootDirs() []string {
+	return []string{filepath.Join(d.home, "tmp")}
 }
 
-// Get returns the mount point for the layered filesystem referred to by the ID.
-func (d *ImageFS) Get(id string, options graphdriver.MountOpts) (string, error) {
-	var ext, fsType string
-	switch d.options.Format {
-	case FormatEROFS:
-		ext = ".erofs"
-		fsType = "erofs"
-	case FormatSquashFS:
-		ext = ".sqsh"
-		fsType = "squashfs"
-	default:
-		return "", fmt.Errorf("imagefs: unsupported format %q", d.options.Format)
+func (d *Driver) Get(id string, options graphdriver.MountOpts) (string, error) {
+	layers, err := d.getLayerStack(id)
+	if err != nil {
+		return "", err
 	}
 
-	imagePath := filepath.Join(d.home, "layers", id+ext)
-	if !d.Exists(id) {
-		return "", fmt.Errorf("imagefs: layer %s does not exist", id)
+	containerID := id
+	var lowerDirs []string
+
+	// Phase 2: Mount each layer in the rundir from bottom to top.
+	// The top-most layer (id) is the writable layer and should not be mounted as a lowerdir.
+	if len(layers) > 0 {
+		layers = layers[:len(layers)-1]
 	}
 
-	mountPoint := filepath.Join(d.home, "mounts", id)
-	if err := os.MkdirAll(mountPoint, 0o755); err != nil {
-		return "", fmt.Errorf("imagefs: failed to create mount point %s: %w", mountPoint, err)
+	for _, layerID := range layers {
+		imagePath := d.getImagePath(layerID)
+		if imagePath == "" {
+			return "", fmt.Errorf("no image file found for layer %s", layerID)
+		}
+
+		// Check if we are root or rootless (simplified check)
+		isRoot := os.Getuid() == 0
+
+		mountPoint, err := d.mm.MountLayer(containerID, layerID, imagePath, isRoot)
+		if err != nil {
+			d.cleanupMounts(containerID, lowerDirs)
+			return "", fmt.Errorf("failed to mount layer %s: %w", layerID, err)
+		}
+		lowerDirs = append(lowerDirs, mountPoint)
 	}
 
-	// We use the 'mount' command because it handles loop device allocation automatically.
-	// The unix.Mount system call does not.
-	cmd := exec.Command("mount", "-t", fsType, "-o", "loop", imagePath, mountPoint)
-	logrus.Debugf("imagefs: mounting image %s to %s using %s", imagePath, mountPoint, fsType)
-	if output, err := cmd.CombinedOutput(); err != nil {
-		return "", fmt.Errorf("imagefs: failed to mount image %s to %s: %s: %w", imagePath, mountPoint, string(output), err)
+	// Lowerdir for OverlayFS is top-to-bottom (most recent first)
+	var lowerdirString string
+	for i := len(lowerDirs) - 1; i >= 0; i-- {
+		if lowerdirString != "" {
+			lowerdirString += ":"
+		}
+		lowerdirString += lowerDirs[i]
 	}
 
-	return mountPoint, nil
+	// Setup upperdir and workdir
+	layerDir := d.dir(id)
+	upperdir := filepath.Join(layerDir, "upper")
+	workdir := filepath.Join(layerDir, "work")
+	mergedDir := filepath.Join(layerDir, "merged")
+
+	if err := os.MkdirAll(upperdir, 0755); err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(workdir, 0755); err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(mergedDir, 0755); err != nil {
+		return "", err
+	}
+
+	// Final Overlay Mount
+	opts := fmt.Sprintf("lowerdir=%s,upperdir=%s,workdir=%s", lowerdirString, upperdir, workdir)
+	logrus.Debugf("[imagefs] Final Overlay Mount: target=%s, opts=%s", mergedDir, opts)
+	err = d.mm.mounter.Mount("overlay", mergedDir, "overlay", opts)
+	if err != nil {
+		d.cleanupMounts(containerID, lowerDirs)
+		return "", fmt.Errorf("failed to mount overlay: %w", err)
+	}
+
+	return mergedDir, nil
 }
 
-// Put releases the system resources for the specified ID.
-func (d *ImageFS) Put(id string) error {
-	mountPoint := filepath.Join(d.home, "mounts", id)
+func (d *Driver) Put(id string) error {
+	// Unmount merged dir
+	mergedDir := filepath.Join(d.dir(id), "merged")
+	if err := d.mm.mounter.Unmount(mergedDir); err != nil && !os.IsNotExist(err) {
+		logrus.Errorf("failed to unmount merged dir %s: %v", mergedDir, err)
+	}
 
-	logrus.Debugf("imagefs: unmounting image from %s", mountPoint)
-	// Use the package mount helper to unmount
-	if err := mount.Unmount(mountPoint); err != nil {
-		// If it's not mounted, we can ignore the error
+	// Unmount layers and cleanup rundir
+	return d.mm.CleanupRundir(id)
+}
+
+func (d *Driver) getLayerStack(id string) ([]string, error) {
+	var stack []string
+	current := id
+	for current != "" {
+		stack = append([]string{current}, stack...)
+		parentFile := filepath.Join(d.dir(current), "parent")
+		data, err := os.ReadFile(parentFile)
+		if err != nil {
+			if os.IsNotExist(err) {
+				current = ""
+			} else {
+				return nil, err
+			}
+		} else {
+			current = strings.TrimSpace(string(data))
+		}
+	}
+	return stack, nil
+}
+
+func (d *Driver) getImagePath(id string) string {
+	// In our updated layout, the image file is stored inside the layer directory:
+	// /home/.../storage/imagefs/<id>/data.img
+
+	img := filepath.Join(d.dir(id), "data.img")
+	if fileutils.Exists(img) == nil {
+		return img
+	}
+
+	// Fallback to .sqsh if we used squashfs
+	sqsh := filepath.Join(d.dir(id), "data.sqsh")
+	if fileutils.Exists(sqsh) == nil {
+		return sqsh
+	}
+
+	return ""
+}
+
+func (d *Driver) cleanupMounts(containerID string, mountedDirs []string) {
+	for _, dir := range mountedDirs {
+		d.mm.UnmountLayer(dir)
+	}
+	d.mm.CleanupRundir(containerID)
+}
+
+func (d *Driver) Exists(id string) bool {
+	return fileutils.Exists(d.dir(id)) == nil
+}
+
+func (d *Driver) ListLayers() ([]string, error) {
+	return nil, fmt.Errorf("ListLayers not implemented")
+}
+
+func (d *Driver) Status() [][2]string {
+	return [][2]string{{"driver", "imagefs"}}
+}
+
+func (d *Driver) Metadata(id string) (map[string]string, error) {
+	path := d.getImagePath(id)
+	if path == "" {
+		return nil, fmt.Errorf("no image or directory found for layer %s", id)
+	}
+
+	meta := make(map[string]string)
+	meta["path"] = path
+
+	// Determine the format
+	if filepath.Ext(path) == ".img" {
+		meta["format"] = "erofs"
+	} else if filepath.Ext(path) == ".sqsh" {
+		meta["format"] = "squashfs"
+	} else {
+		meta["format"] = "directory"
+	}
+
+	return meta, nil
+}
+
+func (d *Driver) ReadWriteDiskUsage(id string) (*directory.DiskUsage, error) {
+	return nil, fmt.Errorf("ReadWriteDiskUsage not implemented")
+}
+
+func (d *Driver) Cleanup() error {
+	return nil
+}
+
+func (d *Driver) AdditionalImageStores() []string {
+	return nil
+}
+
+func (d *Driver) Dedup(args graphdriver.DedupArgs) (graphdriver.DedupResult, error) {
+	return graphdriver.DedupResult{}, fmt.Errorf("Dedup not implemented")
+}
+
+// --- DiffDriver implementation ---
+
+func (d *Driver) Diff(id string, idMappings *idtools.IDMappings, parent string, parentIDMappings *idtools.IDMappings, mountLabel string) (io.ReadCloser, error) {
+	return nil, fmt.Errorf("Diff not implemented")
+}
+
+func (d *Driver) Changes(id string, idMappings *idtools.IDMappings, parent string, parentIDMappings *idtools.IDMappings, mountLabel string) ([]archive.Change, error) {
+	return nil, fmt.Errorf("Changes not implemented")
+}
+
+func (d *Driver) ApplyDiff(id string, options graphdriver.ApplyDiffOpts) (int64, error) {
+	// To create an immutable image file from a diff stream, we must:
+	// 1. Extract the stream to a temporary directory.
+	// 2. Use a tool like mkfs.erofs to create the image file from that directory.
+	// 3. Store the resulting image file inside the layer's directory.
+
+	tempDir, err := os.MkdirTemp("", "imagefs-apply-diff-")
+	if err != nil {
+		return 0, fmt.Errorf("failed to create temp dir: %w", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	// Extract the layer blob to the temp directory
+	bytesWritten, err := archive.ApplyLayer(tempDir, options.Diff)
+	if err != nil {
+		return 0, fmt.Errorf("failed to extract layer to temp dir: %w", err)
+	}
+
+	// Create the image file inside the layer's metadata directory
+	// This keeps the storage layout clean: /home/.../storage/imagefs/<id>/data.img
+	imagePath := filepath.Join(d.dir(id), "data.img")
+	if err := d.createImageFile(tempDir, imagePath); err != nil {
+		return 0, fmt.Errorf("failed to create image file %s: %w", imagePath, err)
+	}
+
+	return bytesWritten, nil
+}
+
+func (d *Driver) createImageFile(srcDir, destFile string) error {
+	// We prefer erofs, fallback to squashfs
+	err := d.runMkfsErofs(srcDir, destFile)
+	if err == nil {
 		return nil
 	}
 
-	if err := os.RemoveAll(mountPoint); err != nil {
-		return fmt.Errorf("imagefs: failed to remove mount point %s: %w", mountPoint, err)
+	logrus.Warnf("[imagefs] mkfs.erofs failed or not found, trying mksquashfs: %v", err)
+
+	// If erofs fails, try squashfs (adjusting extension)
+	sqshFile := strings.TrimSuffix(destFile, filepath.Ext(destFile)) + ".sqsh"
+	if err := d.runMkfsSquashfs(srcDir, sqshFile); err != nil {
+		return fmt.Errorf("both mkfs.erofs and mksquashfs failed: %w", err)
 	}
 
 	return nil
 }
 
-// Exists checks whether a layer with the specified ID exists.
-func (d *ImageFS) Exists(id string) bool {
-	var ext string
-	switch d.options.Format {
-	case FormatEROFS:
-		ext = ".erofs"
-	case FormatSquashFS:
-		ext = ".sqsh"
-	default:
-		return false
+func (d *Driver) runMkfsErofs(src, dest string) error {
+	// Correct syntax: mkfs.erofs <dest_image> <source_dir>
+	cmd := exec.Command("mkfs.erofs", dest, src)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("mkfs.erofs failed: %w: %s", err, stderr.String())
 	}
-
-	path := filepath.Join(d.home, "layers", id+ext)
-	_, err := os.Stat(path)
-	return err == nil
-}
-
-// ListLayers returns a list of layer IDs that exist on this driver.
-func (d *ImageFS) ListLayers() ([]string, error) {
-	var ext string
-	switch d.options.Format {
-	case FormatEROFS:
-		ext = ".erofs"
-	case FormatSquashFS:
-		ext = ".sqsh"
-	default:
-		return nil, fmt.Errorf("imagefs: unsupported format %q", d.options.Format)
-	}
-
-	layersDir := filepath.Join(d.home, "layers")
-	entries, err := os.ReadDir(layersDir)
-	if err != nil {
-		return nil, fmt.Errorf("imagefs: failed to read layers directory: %w", err)
-	}
-
-	var layers []string
-	for _, entry := range entries {
-		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ext) {
-			layers = append(layers, strings.TrimSuffix(entry.Name(), ext))
-		}
-	}
-	return layers, nil
-}
-
-// ReadWriteDiskUsage returns the disk usage of the writable directory for the specified ID.
-// Currently returns zero usage as no actual storage is managed.
-func (d *ImageFS) ReadWriteDiskUsage(id string) (*directory.DiskUsage, error) {
-	return &directory.DiskUsage{}, nil
-}
-
-// AdditionalImageStores returns additional image stores supported by the driver.
-// Currently returns an empty list as no additional image stores are configured.
-func (d *ImageFS) AdditionalImageStores() []string {
 	return nil
 }
 
-// Dedup performs deduplication of the driver's storage.
-// Returns an error indicating this method is not yet implemented.
-func (d *ImageFS) Dedup(req graphdriver.DedupArgs) (graphdriver.DedupResult, error) {
-	return graphdriver.DedupResult{}, fmt.Errorf("imagefs: Dedup not yet implemented")
+func (d *Driver) runMkfsSquashfs(src, dest string) error {
+	// mksquashfs <dir> <dest> -noappend
+	cmd := exec.Command("mksquashfs", src, dest, "-noappend")
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("mksquashfs failed: %w: %s", err, stderr.String())
+	}
+	return nil
 }
 
-// Diff produces an archive of the changes between the specified layer and its parent.
-// Returns an error indicating this method is not yet implemented.
-func (d *ImageFS) Diff(id string, idMappings *idtools.IDMappings, parent string, parentMappings *idtools.IDMappings, mountLabel string) (io.ReadCloser, error) {
-	return nil, fmt.Errorf("imagefs: Diff not yet implemented")
+func (d *Driver) DiffSize(id string, idMappings *idtools.IDMappings, parent string, parentIDMappings *idtools.IDMappings, mountLabel string) (int64, error) {
+	return 0, fmt.Errorf("DiffSize not implemented")
 }
 
-// Changes produces a list of changes between the specified layer and its parent.
-// Returns an error indicating this method is not yet implemented.
-func (d *ImageFS) Changes(id string, idMappings *idtools.IDMappings, parent string, parentMappings *idtools.IDMappings, mountLabel string) ([]archive.Change, error) {
-	return nil, fmt.Errorf("imagefs: Changes not yet implemented")
+// --- LayerIDMapUpdater implementation ---
+
+func (d *Driver) UpdateLayerIDMap(id string, toContainer, toHost *idtools.IDMappings, mountLabel string) error {
+	return nil
 }
 
-// ApplyDiff extracts the changeset from the given diff into the layer with the specified ID.
-func (d *ImageFS) ApplyDiff(id string, options graphdriver.ApplyDiffOpts) (size int64, err error) {
-	var ext string
-	var tool string
-	var args []string
-
-	switch d.options.Format {
-	case FormatEROFS:
-		ext = ".erofs"
-		tool = "mkfs.erofs"
-	case FormatSquashFS:
-		ext = ".sqsh"
-		tool = "tar2sqfs"
-	default:
-		return 0, fmt.Errorf("imagefs: unsupported format %q", d.options.Format)
-	}
-
-	finalPath := filepath.Join(d.home, "layers", id+ext)
-	tmpImgPath := finalPath + ".tmp"
-
-	// Prepare tool arguments. Both tools support reading the tarball from stdin
-	// if the input file path is omitted.
-	if d.options.Format == FormatEROFS {
-		// --tar=f tells mkfs.erofs to read from stdin.
-		args = []string{"--tar=f", "-zlz4", tmpImgPath}
-	} else {
-		// For tar2sqfs, omitting the input file makes it read from stdin.
-		args = []string{"-f", tmpImgPath}
-	}
-
-	logrus.Debugf("imagefs: converting tarball to %s image using %s %v", d.options.Format, tool, args)
-	cmd := exec.Command(tool, args...)
-	cmd.Stdin = options.Diff
-
-	if output, err := cmd.CombinedOutput(); err != nil {
-		os.Remove(tmpImgPath)
-		return 0, fmt.Errorf("imagefs: conversion tool %q failed: %s: %w", tool, string(output), err)
-	}
-
-	// Atomic write: rename tmp image to final image
-	if err := os.Rename(tmpImgPath, finalPath); err != nil {
-		os.Remove(tmpImgPath)
-		return 0, fmt.Errorf("imagefs: failed to rename tmp image to final path: %w", err)
-	}
-
-	// Get the size of the created image
-	fi, err := os.Stat(finalPath)
-	if err != nil {
-		return 0, fmt.Errorf("imagefs: failed to stat created image: %w", err)
-	}
-
-	return fi.Size(), nil
-}
-
-// DiffSize calculates the changes between the specified ID and its parent.
-// Returns an error indicating this method is not yet implemented.
-func (d *ImageFS) DiffSize(id string, idMappings *idtools.IDMappings, parent string, parentMappings *idtools.IDMappings, mountLabel string) (size int64, err error) {
-	return 0, fmt.Errorf("imagefs: DiffSize not yet implemented")
-}
-
-// SupportsShifting tells whether the driver supports shifting of UIDs/GIDs.
-// Currently returns false as ID shifting is not implemented.
-func (d *ImageFS) SupportsShifting(uidmap, gidmap []idtools.IDMap) bool {
+func (d *Driver) SupportsShifting(uidmap, gidmap []idtools.IDMap) bool {
 	return false
 }
 
-// UpdateLayerIDMap updates the layer's filesystem tree with new ownership information.
-// Returns an error indicating this method is not yet implemented.
-func (d *ImageFS) UpdateLayerIDMap(id string, toContainer, toHost *idtools.IDMappings, mountLabel string) error {
-	return fmt.Errorf("imagefs: UpdateLayerIDMap not yet implemented")
+// --- Helpers ---
+
+func (d *Driver) dir(id string) string {
+	path := filepath.Join(d.home, id)
+	d.relabel(path)
+	return path
+}
+
+func (d *Driver) relabel(path string) {
+	// Attempt to relabel the path to container_file_t for SELinux.
+	// This is necessary for rootless containers to access files in the home directory.
+	// We ignore errors here because chcon might not be installed or SELinux might be disabled.
+	_ = exec.Command("chcon", "-t", "container_file_t", path).Run()
 }

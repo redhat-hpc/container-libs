@@ -15,6 +15,7 @@ import (
 type Mounter interface {
 	Mount(source, target, fsType, options string) error
 	Unmount(target string) error
+	LazyUnmount(target string) error
 	RunCommand(name string, args ...string) error
 }
 
@@ -26,6 +27,10 @@ func (r *RealMounter) Mount(source, target, fsType, options string) error {
 
 func (r *RealMounter) Unmount(target string) error {
 	return mount.Unmount(target)
+}
+
+func (r *RealMounter) LazyUnmount(target string) error {
+	return r.RunCommand("umount", "-l", target)
 }
 
 func (r *RealMounter) RunCommand(name string, args ...string) error {
@@ -43,10 +48,13 @@ type MountManager struct {
 	mounter Mounter
 }
 
-func NewMountManager(runRoot string) *MountManager {
+func NewMountManager(runRoot string, mounter Mounter) *MountManager {
+	if mounter == nil {
+		mounter = &RealMounter{}
+	}
 	return &MountManager{
 		runRoot: runRoot,
-		mounter: &RealMounter{},
+		mounter: mounter,
 	}
 }
 
@@ -128,7 +136,7 @@ func (m *MountManager) UnmountLayer(target string) error {
 	err := m.mounter.Unmount(target)
 	if err != nil {
 		logrus.Debugf("mounter.Unmount failed for %s, trying lazy umount: %v", target, err)
-		if err := m.mounter.RunCommand("umount", "-l", target); err != nil {
+		if err := m.mounter.LazyUnmount(target); err != nil {
 			return fmt.Errorf("failed to unmount %s: %w", target, err)
 		}
 	}
@@ -150,7 +158,7 @@ func (m *MountManager) CleanupRundir(containerID string) error {
 		if entry.IsDir() {
 			path := filepath.Join(rundir, entry.Name())
 			// We use lazy unmount to ensure we break the link even if files are open.
-			_ = m.mounter.RunCommand("umount", "-l", path)
+			_ = m.mounter.LazyUnmount(path)
 		}
 	}
 

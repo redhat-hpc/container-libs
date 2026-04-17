@@ -18,6 +18,8 @@ import (
 	"go.podman.io/storage/pkg/idtools"
 )
 
+const parentFileName = "parent"
+
 type Driver struct {
 	home    string
 	runRoot string
@@ -26,11 +28,16 @@ type Driver struct {
 }
 
 func Init(home string, options graphdriver.Options) (graphdriver.Driver, error) {
+	opts, err := parseOptions(options.DriverOptions)
+	if err != nil {
+		return nil, err
+	}
+
 	return &Driver{
 		home:    home,
 		runRoot: options.RunRoot,
-		options: Options{Format: FormatEROFS},
-		mm:      NewMountManager(options.RunRoot),
+		options: *opts,
+		mm:      NewMountManager(options.RunRoot, nil),
 	}, nil
 }
 
@@ -45,29 +52,23 @@ func (d *Driver) String() string {
 }
 
 func (d *Driver) CreateReadWrite(id, parent string, opts *graphdriver.CreateOpts) error {
-	// For imagefs, we just need to ensure the directory for the writable layer exists.
-	// The actual layering happens at mount time.
-	dir := d.dir(id)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return fmt.Errorf("failed to create directory %s: %w", dir, err)
-	}
-	if parent != "" {
-		if err := os.WriteFile(filepath.Join(dir, "parent"), []byte(parent), 0644); err != nil {
-			return fmt.Errorf("failed to write parent file: %w", err)
-		}
-	}
-	return nil
+	return d.createLayer(id, parent)
 }
 
 func (d *Driver) Create(id, parent string, opts *graphdriver.CreateOpts) error {
-	// In imagefs, RO layers are assumed to be .img or .sqsh files in the home directory.
-	// We create a directory for metadata.
+	return d.createLayer(id, parent)
+}
+
+func (d *Driver) createLayer(id, parent string) error {
 	dir := d.dir(id)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return fmt.Errorf("failed to create directory %s: %w", dir, err)
 	}
+
+	d.relabel(dir)
+
 	if parent != "" {
-		if err := os.WriteFile(filepath.Join(dir, "parent"), []byte(parent), 0644); err != nil {
+		if err := os.WriteFile(filepath.Join(dir, parentFileName), []byte(parent), 0644); err != nil {
 			return fmt.Errorf("failed to write parent file: %w", err)
 		}
 	}
@@ -106,6 +107,14 @@ func (d *Driver) Get(id string, options graphdriver.MountOpts) (string, error) {
 	containerID := id
 	var lowerDirs []string
 
+	// Use a defer to clean up mounts if an error occurs during the setup process.
+	var success bool
+	defer func() {
+		if !success {
+			d.cleanupMounts(containerID, lowerDirs)
+		}
+	}()
+
 	// Phase 2: Mount each layer in the rundir from bottom to top.
 	// The top-most layer (id) is the writable layer and should not be mounted as a lowerdir.
 	if len(layers) > 0 {
@@ -123,20 +132,17 @@ func (d *Driver) Get(id string, options graphdriver.MountOpts) (string, error) {
 
 		mountPoint, err := d.mm.MountLayer(containerID, layerID, imagePath, isRoot)
 		if err != nil {
-			d.cleanupMounts(containerID, lowerDirs)
 			return "", fmt.Errorf("failed to mount layer %s: %w", layerID, err)
 		}
 		lowerDirs = append(lowerDirs, mountPoint)
 	}
 
 	// Lowerdir for OverlayFS is top-to-bottom (most recent first)
-	var lowerdirString string
-	for i := len(lowerDirs) - 1; i >= 0; i-- {
-		if lowerdirString != "" {
-			lowerdirString += ":"
-		}
-		lowerdirString += lowerDirs[i]
+	// Reverse the slice of mounted directories
+	for i, j := 0, len(lowerDirs)-1; i < j; i, j = i+1, j-1 {
+		lowerDirs[i], lowerDirs[j] = lowerDirs[j], lowerDirs[i]
 	}
+	lowerdirString := strings.Join(lowerDirs, ":")
 
 	// Setup upperdir and workdir
 	layerDir := d.dir(id)
@@ -159,10 +165,10 @@ func (d *Driver) Get(id string, options graphdriver.MountOpts) (string, error) {
 	logrus.Debugf("[imagefs] Final Overlay Mount: target=%s, opts=%s", mergedDir, opts)
 	err = d.mm.mounter.Mount("overlay", mergedDir, "overlay", opts)
 	if err != nil {
-		d.cleanupMounts(containerID, lowerDirs)
 		return "", fmt.Errorf("failed to mount overlay: %w", err)
 	}
 
+	success = true
 	return mergedDir, nil
 }
 
@@ -182,7 +188,7 @@ func (d *Driver) getLayerStack(id string) ([]string, error) {
 	current := id
 	for current != "" {
 		stack = append([]string{current}, stack...)
-		parentFile := filepath.Join(d.dir(current), "parent")
+		parentFile := filepath.Join(d.dir(current), parentFileName)
 		data, err := os.ReadFile(parentFile)
 		if err != nil {
 			if os.IsNotExist(err) {
@@ -201,15 +207,12 @@ func (d *Driver) getImagePath(id string) string {
 	// In our updated layout, the image file is stored inside the layer directory:
 	// /home/.../storage/imagefs/<id>/data.img
 
-	img := filepath.Join(d.dir(id), "data.img")
-	if fileutils.Exists(img) == nil {
-		return img
-	}
-
-	// Fallback to .sqsh if we used squashfs
-	sqsh := filepath.Join(d.dir(id), "data.sqsh")
-	if fileutils.Exists(sqsh) == nil {
-		return sqsh
+	extensions := []string{".img", ".sqsh"}
+	for _, ext := range extensions {
+		img := filepath.Join(d.dir(id), "data"+ext)
+		if fileutils.Exists(img) == nil {
+			return img
+		}
 	}
 
 	return ""
@@ -252,6 +255,7 @@ func (d *Driver) Metadata(id string) (map[string]string, error) {
 		meta["format"] = "directory"
 	}
 
+	logrus.Debugf("[imagefs] Metadata for layer identified: %v", meta)
 	return meta, nil
 }
 
@@ -282,69 +286,37 @@ func (d *Driver) Changes(id string, idMappings *idtools.IDMappings, parent strin
 }
 
 func (d *Driver) ApplyDiff(id string, options graphdriver.ApplyDiffOpts) (int64, error) {
-	// To create an immutable image file from a diff stream, we must:
-	// 1. Extract the stream to a temporary directory.
-	// 2. Use a tool like mkfs.erofs to create the image file from that directory.
-	// 3. Store the resulting image file inside the layer's directory.
-
-	tempDir, err := os.MkdirTemp("", "imagefs-apply-diff-")
-	if err != nil {
-		return 0, fmt.Errorf("failed to create temp dir: %w", err)
-	}
-	defer os.RemoveAll(tempDir)
-
-	// Extract the layer blob to the temp directory
-	bytesWritten, err := archive.ApplyLayer(tempDir, options.Diff)
-	if err != nil {
-		return 0, fmt.Errorf("failed to extract layer to temp dir: %w", err)
-	}
-
-	// Create the image file inside the layer's metadata directory
-	// This keeps the storage layout clean: /home/.../storage/imagefs/<id>/data.img
+	// To create an immutable image file from a diff stream, we pipe the tarball
+	// stream directly into mkfs.erofs via stdin.
 	imagePath := filepath.Join(d.dir(id), "data.img")
-	if err := d.createImageFile(tempDir, imagePath); err != nil {
+
+	if err := d.createImageFile(options.Diff, imagePath); err != nil {
 		return 0, fmt.Errorf("failed to create image file %s: %w", imagePath, err)
 	}
 
-	return bytesWritten, nil
-}
-
-func (d *Driver) createImageFile(srcDir, destFile string) error {
-	// We prefer erofs, fallback to squashfs
-	err := d.runMkfsErofs(srcDir, destFile)
-	if err == nil {
-		return nil
+	info, err := os.Stat(imagePath)
+	if err != nil {
+		return 0, fmt.Errorf("failed to stat resulting image file: %w", err)
 	}
 
-	logrus.Warnf("[imagefs] mkfs.erofs failed or not found, trying mksquashfs: %v", err)
-
-	// If erofs fails, try squashfs (adjusting extension)
-	sqshFile := strings.TrimSuffix(destFile, filepath.Ext(destFile)) + ".sqsh"
-	if err := d.runMkfsSquashfs(srcDir, sqshFile); err != nil {
-		return fmt.Errorf("both mkfs.erofs and mksquashfs failed: %w", err)
-	}
-
-	return nil
+	logrus.Debugf("[imagefs] layer %s wrote %d bytes", imagePath, info.Size())
+	return info.Size(), nil
 }
 
-func (d *Driver) runMkfsErofs(src, dest string) error {
-	// Correct syntax: mkfs.erofs <dest_image> <source_dir>
-	cmd := exec.Command("mkfs.erofs", dest, src)
+func (d *Driver) createImageFile(r io.Reader, destFile string) error {
+	return d.runMkfsErofs(r, destFile)
+}
+
+func (d *Driver) runMkfsErofs(r io.Reader, dest string) error {
+	// mkfs.erofs -t tar <dest_image> - <source_tarball_on_stdin>
+	cmd := exec.Command("mkfs.erofs", "--tar=f", "-zlz4", dest)
+	cmd.Stdin = r
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
+
+	logrus.Debugf("[imagefs] Creating the layer: %v", cmd.Args)
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("mkfs.erofs failed: %w: %s", err, stderr.String())
-	}
-	return nil
-}
-
-func (d *Driver) runMkfsSquashfs(src, dest string) error {
-	// mksquashfs <dir> <dest> -noappend
-	cmd := exec.Command("mksquashfs", src, dest, "-noappend")
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("mksquashfs failed: %w: %s", err, stderr.String())
 	}
 	return nil
 }
@@ -366,9 +338,7 @@ func (d *Driver) SupportsShifting(uidmap, gidmap []idtools.IDMap) bool {
 // --- Helpers ---
 
 func (d *Driver) dir(id string) string {
-	path := filepath.Join(d.home, id)
-	d.relabel(path)
-	return path
+	return filepath.Join(d.home, id)
 }
 
 func (d *Driver) relabel(path string) {

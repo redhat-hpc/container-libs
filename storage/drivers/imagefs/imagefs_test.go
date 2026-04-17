@@ -24,12 +24,15 @@ func (m *MockMounter) Unmount(target string) error {
 	return args.Error(0)
 }
 
+func (m *MockMounter) LazyUnmount(target string) error {
+	args := m.Called(target)
+	return args.Error(0)
+}
+
 func (m *MockMounter) RunCommand(name string, args ...string) error {
-	// We use a slice for the call to match how we pass arguments in the mock
 	argsSlice := make([]string, 0, len(args)+1)
 	argsSlice = append(argsSlice, name)
 	argsSlice = append(argsSlice, args...)
-	
 	mCalled := m.Called(argsSlice)
 	return mCalled.Error(0)
 }
@@ -56,8 +59,8 @@ func TestDriver_Get(t *testing.T) {
 		if i < len(layers)-1 {
 			os.WriteFile(filepath.Join(dir, "parent"), []byte(layers[i+1]), 0644)
 		}
-		// Create dummy image file
-		os.WriteFile(filepath.Join(tmpDir, l+".img"), []byte("dummy"), 0644)
+		// Create dummy image file in the correct location: <layer_dir>/data.img
+		os.WriteFile(filepath.Join(dir, "data.img"), []byte("dummy"), 0644)
 	}
 
 	// Mock mount calls for each layer

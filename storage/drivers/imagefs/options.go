@@ -3,8 +3,6 @@ package imagefs
 import (
 	"fmt"
 	"strings"
-
-	graphdriver "go.podman.io/storage/drivers"
 )
 
 // Options represents the configuration for the imagefs storage driver.
@@ -35,12 +33,4 @@ func parseOptions(options []string) (*Options, error) {
 		}
 	}
 	return opts, nil
-}
-
-// ToDriverOptions converts Options to the graphdriver.Options format
-// for compatibility with the storage driver framework.
-func (o *Options) ToDriverOptions() graphdriver.Options {
-	return graphdriver.Options{
-		DriverOptions: []string{},
-	}
 }

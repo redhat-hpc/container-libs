@@ -16,6 +16,7 @@ import (
 	"go.podman.io/storage/pkg/directory"
 	"go.podman.io/storage/pkg/fileutils"
 	"go.podman.io/storage/pkg/idtools"
+	"go.podman.io/storage/pkg/parsers/kernel"
 )
 
 const parentFileName = "parent"
@@ -115,33 +116,42 @@ func (d *Driver) Get(id string, options graphdriver.MountOpts) (string, error) {
 		}
 	}()
 
-	// Phase 2: Mount each layer in the rundir from bottom to top.
 	// The top-most layer (id) is the writable layer and should not be mounted as a lowerdir.
 	if len(layers) > 0 {
 		layers = layers[:len(layers)-1]
 	}
 
-	for _, layerID := range layers {
-		imagePath := d.getImagePath(layerID)
-		if imagePath == "" {
-			return "", fmt.Errorf("no image file found for layer %s", layerID)
-		}
-
-		// Check if we are root or rootless (simplified check)
-		isRoot := os.Getuid() == 0
-
-		mountPoint, err := d.mm.MountLayer(containerID, layerID, imagePath, isRoot)
+	if len(layers) == 0 {
+		lowerDirs = []string{}
+	} else {
+		// Determine strategy based on whether all layers are EROFS
+		useMerged, err := d.canUseMergedErofs(layers)
 		if err != nil {
-			return "", fmt.Errorf("failed to mount layer %s: %w", layerID, err)
+			return "", err
 		}
-		lowerDirs = append(lowerDirs, mountPoint)
+
+		if useMerged {
+			logrus.Debugf("[imagefs] Using merged EROFS strategy for container %s", containerID)
+			lowerDirs, err = d.mountErofsMerged(containerID, layers)
+		} else {
+			logrus.Debugf("[imagefs] Using separate layers strategy for container %s", containerID)
+			lowerDirs, err = d.mountLayersSeparately(containerID, layers)
+		}
+
+		if err != nil {
+			return "", err
+		}
+
+		// Lowerdir for OverlayFS is top-to-bottom (most recent first)
+		// If we used separate mounts, they were mounted bottom-to-top, so we reverse.
+		// If we used merged, there is only one mount point, so reverse does nothing.
+		if !useMerged {
+			for i, j := 0, len(lowerDirs)-1; i < j; i, j = i+1, j-1 {
+				lowerDirs[i], lowerDirs[j] = lowerDirs[j], lowerDirs[i]
+			}
+		}
 	}
 
-	// Lowerdir for OverlayFS is top-to-bottom (most recent first)
-	// Reverse the slice of mounted directories
-	for i, j := 0, len(lowerDirs)-1; i < j; i, j = i+1, j-1 {
-		lowerDirs[i], lowerDirs[j] = lowerDirs[j], lowerDirs[i]
-	}
 	lowerdirString := strings.Join(lowerDirs, ":")
 
 	// Setup upperdir and workdir
@@ -170,6 +180,70 @@ func (d *Driver) Get(id string, options graphdriver.MountOpts) (string, error) {
 
 	success = true
 	return mergedDir, nil
+}
+
+func (d *Driver) canUseMergedErofs(layers []string) (bool, error) {
+	for _, layerID := range layers {
+		path := d.getImagePath(layerID)
+		if !kernel.CheckKernelVersion(5, 15, 0) {
+			return false, nil
+		}
+		if path == "" {
+			return false, fmt.Errorf("no image file found for layer %s", layerID)
+		}
+		if filepath.Ext(path) != ".img" {
+			return false, nil // At least one layer is not EROFS
+		}
+		if len(layers) == 1 {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+func (d *Driver) mountLayersSeparately(containerID string, layers []string) ([]string, error) {
+	var lowerDirs []string
+	for _, layerID := range layers {
+		imagePath := d.getImagePath(layerID)
+		if imagePath == "" {
+			return nil, fmt.Errorf("no image file found for layer %s", layerID)
+		}
+
+		isRoot := os.Getuid() == 0
+		mountPoint, err := d.mm.MountLayer(containerID, layerID, imagePath, isRoot)
+		if err != nil {
+			return nil, fmt.Errorf("failed to mount layer %s: %w", layerID, err)
+		}
+		lowerDirs = append(lowerDirs, mountPoint)
+	}
+	return lowerDirs, nil
+}
+
+func (d *Driver) mountErofsMerged(containerID string, layers []string) ([]string, error) {
+	var imagePaths []string
+	for _, layerID := range layers {
+		path := d.getImagePath(layerID)
+		imagePaths = append(imagePaths, path)
+	}
+
+	rundir := d.mm.GetRundir(containerID)
+	mergedImagePath := filepath.Join(rundir, "merged_layers.img")
+
+	// mkfs.erofs <dest> <src1> <src2> ...
+	args := append([]string{mergedImagePath}, imagePaths...)
+	cmd := exec.Command("mkfs.erofs", args...)
+	logrus.Debugf("[imagefs] Creating merged erofs volume: %v", cmd.Args)
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("failed to merge EROFS layers: %w", err)
+	}
+
+	isRoot := os.Getuid() == 0
+	mountPoint, err := d.mm.MountLayer(containerID, "merged-layers", mergedImagePath, isRoot)
+	if err != nil {
+		return nil, fmt.Errorf("failed to mount merged EROFS image: %w", err)
+	}
+
+	return []string{mountPoint}, nil
 }
 
 func (d *Driver) Put(id string) error {
@@ -309,7 +383,7 @@ func (d *Driver) createImageFile(r io.Reader, destFile string) error {
 
 func (d *Driver) runMkfsErofs(r io.Reader, dest string) error {
 	// mkfs.erofs -t tar <dest_image> - <source_tarball_on_stdin>
-	cmd := exec.Command("mkfs.erofs", "--tar=f", "-zlz4", dest)
+	cmd := exec.Command("mkfs.erofs", "--tar=f", "-zlz4hc", "--chunksize=0", dest)
 	cmd.Stdin = r
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr

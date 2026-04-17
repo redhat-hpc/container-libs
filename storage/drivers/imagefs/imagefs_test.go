@@ -38,44 +38,92 @@ func (m *MockMounter) RunCommand(name string, args ...string) error {
 }
 
 func TestDriver_Get(t *testing.T) {
-	tmpDir := t.TempDir()
-	runRoot := t.TempDir()
-	
-	mockMounter := new(MockMounter)
-	d := &Driver{
-		home:    tmpDir,
-		runRoot: runRoot,
-		mm: &MountManager{
+	t.Run("MergedErofsStrategy", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		runRoot := t.TempDir()
+
+		mockMounter := new(MockMounter)
+		d := &Driver{
+			home:    tmpDir,
 			runRoot: runRoot,
-			mounter: mockMounter,
-		},
-	}
-
-	// Setup layers: L1 -> L2 -> L3 (L3 is the top)
-	layers := []string{"L1", "L2", "L3"}
-	for i, l := range layers {
-		dir := filepath.Join(tmpDir, l)
-		os.MkdirAll(dir, 0755)
-		if i < len(layers)-1 {
-			os.WriteFile(filepath.Join(dir, "parent"), []byte(layers[i+1]), 0644)
+			mm: &MountManager{
+				runRoot: runRoot,
+				mounter: mockMounter,
+			},
 		}
-		// Create dummy image file in the correct location: <layer_dir>/data.img
-		os.WriteFile(filepath.Join(dir, "data.img"), []byte("dummy"), 0644)
-	}
 
-	// Mock mount calls for each layer
-	// Use mock.Anything for options because they might vary (nodev,nosuid)
-	mockMounter.On("Mount", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Maybe().Return(nil)
-	mockMounter.On("RunCommand", mock.Anything).Maybe().Return(nil)
-	
-	// Mock the final overlay mount
-	mockMounter.On("Mount", "overlay", mock.Anything, "overlay", mock.Anything).Return(nil)
+		// Setup layers: L1 -> L2 -> L3 (L3 is the top)
+		layers := []string{"L1", "L2", "L3"}
+		for i, l := range layers {
+			dir := filepath.Join(tmpDir, l)
+			os.MkdirAll(dir, 0755)
+			if i < len(layers)-1 {
+				os.WriteFile(filepath.Join(dir, "parent"), []byte(layers[i+1]), 0644)
+			}
+			os.WriteFile(filepath.Join(dir, "data.img"), []byte("dummy"), 0644)
+		}
 
-	mergedDir, err := d.Get("L1", graphdriver.MountOpts{})
-	assert.NoError(t, err)
-	assert.Contains(t, mergedDir, "merged")
-	
-	mockMounter.AssertExpectations(t)
+		// Mock mkfs.erofs call
+		mockMounter.On("RunCommand", mock.MatchedBy(func(args []string) bool {
+			return args[0] == "mkfs.erofs"
+		})).Return(nil)
+
+		// Mock erofsfuse call (used by MountLayer in rootless mode)
+		mockMounter.On("RunCommand", mock.MatchedBy(func(args []string) bool {
+			return args[0] == "erofsfuse"
+		})).Return(nil)
+
+		mockMounter.On("Mount", mock.Anything, mock.Anything, "erofs", mock.Anything).Return(nil)
+		mockMounter.On("Mount", "overlay", mock.Anything, "overlay", mock.Anything).Return(nil)
+		
+		// Mock cleanup calls
+		mockMounter.On("LazyUnmount", mock.Anything).Return(nil)
+
+		mergedDir, err := d.Get("L1", graphdriver.MountOpts{})
+		assert.NoError(t, err)
+		assert.Contains(t, mergedDir, "merged")
+	})
+
+	t.Run("SeparateLayersStrategy", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		runRoot := t.TempDir()
+
+		mockMounter := new(MockMounter)
+		d := &Driver{
+			home:    tmpDir,
+			runRoot: runRoot,
+			mm: &MountManager{
+				runRoot: runRoot,
+				mounter: mockMounter,
+			},
+		}
+
+		// Setup layers: L1 (.img) -> L2 (.sqsh) -> L3 (.img)
+		layers := []string{"L1", "L2", "L3"}
+		exts := []string{".img", ".sqsh", ".img"}
+		for i, l := range layers {
+			dir := filepath.Join(tmpDir, l)
+			os.MkdirAll(dir, 0755)
+			if i < len(layers)-1 {
+				os.WriteFile(filepath.Join(dir, "parent"), []byte(layers[i+1]), 0644)
+			}
+			os.WriteFile(filepath.Join(dir, "data"+exts[i]), []byte("dummy"), 0644)
+		}
+
+		// Mock FUSE mounts for separate layers
+		mockMounter.On("RunCommand", mock.MatchedBy(func(args []string) bool {
+			return args[0] == "erofsfuse" || args[0] == "squashfuse"
+		})).Return(nil)
+		
+		mockMounter.On("Mount", "overlay", mock.Anything, "overlay", mock.Anything).Return(nil)
+		
+		// Mock cleanup calls
+		mockMounter.On("LazyUnmount", mock.Anything).Return(nil)
+
+		mergedDir, err := d.Get("L1", graphdriver.MountOpts{})
+		assert.NoError(t, err)
+		assert.Contains(t, mergedDir, "merged")
+	})
 }
 
 func TestDriver_Put(t *testing.T) {

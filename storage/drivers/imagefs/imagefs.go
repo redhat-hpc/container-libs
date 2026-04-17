@@ -383,7 +383,7 @@ func (d *Driver) createImageFile(r io.Reader, destFile string) error {
 
 func (d *Driver) runMkfsErofs(r io.Reader, dest string) error {
 	// mkfs.erofs -t tar <dest_image> - <source_tarball_on_stdin>
-	cmd := exec.Command("mkfs.erofs", "--tar=f", "-zlz4hc", "--chunksize=0", dest)
+	cmd := exec.Command("mkfs.erofs", "--tar=f", dest)
 	cmd.Stdin = r
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
@@ -394,6 +394,34 @@ func (d *Driver) runMkfsErofs(r io.Reader, dest string) error {
 	}
 	return nil
 }
+
+// func (d *Driver) runMkfsErofsWithExtraction(r io.Reader, dest string) error {
+// 	// Create a temporary directory for extraction
+// 	rootDir := d.GetTempDirRootDirs()[0]
+// 	td, err := tempdir.NewTempDir(rootDir)
+// 	if err != nil {
+// 		return fmt.Errorf("failed to create temp dir for extraction: %w", err)
+// 	}
+// 	defer td.Cleanup()
+
+// 	// Extract the tarball stream into the temporary directory
+// 	if err := archive.Untar(r, td.Path(), &archive.TarOptions{}); err != nil {
+// 		return fmt.Errorf("failed to extract layer to temp dir: %w", err)
+// 	}
+
+// 	// Run mkfs.erofs on the extracted directory
+// 	// mkfs.erofs <dest_image> <source_dir>
+// 	cmd := exec.Command("mkfs.erofs", dest, td.Path())
+// 	var stderr bytes.Buffer
+// 	cmd.Stderr = &stderr
+
+// 	logrus.Debugf("[imagefs] Creating the layer from directory: %v", cmd.Args)
+// 	if err := cmd.Run(); err != nil {
+// 		return fmt.Errorf("mkfs.erofs failed: %w: %s", err, stderr.String())
+// 	}
+
+// 	return nil
+// }
 
 func (d *Driver) DiffSize(id string, idMappings *idtools.IDMappings, parent string, parentIDMappings *idtools.IDMappings, mountLabel string) (int64, error) {
 	return 0, fmt.Errorf("DiffSize not implemented")

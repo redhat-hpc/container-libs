@@ -228,13 +228,21 @@ func (d *Driver) mountErofsMerged(containerID string, layers []string) ([]string
 	}
 
 	rundir := d.mm.GetRundir(containerID)
+	os.MkdirAll(rundir, 0o755)
+
 	mergedImagePath := filepath.Join(rundir, "merged_layers.img")
 
 	// mkfs.erofs <dest> <src1> <src2> ...
 	args := append([]string{mergedImagePath}, imagePaths...)
 	cmd := exec.Command("mkfs.erofs", args...)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
 	logrus.Debugf("[imagefs] Creating merged erofs volume: %v", cmd.Args)
 	if err := cmd.Run(); err != nil {
+		logrus.Debugf("merge error stdout: %s", stdout.String())
+		logrus.Debugf("merge error stderr: %s", stderr.String())
 		return nil, fmt.Errorf("failed to merge EROFS layers: %w", err)
 	}
 
@@ -406,7 +414,11 @@ func (d *Driver) createImageFile(r io.Reader, destFile string) error {
 
 func (d *Driver) runMkfsErofs(r io.Reader, dest string) error {
 	// mkfs.erofs -t tar <dest_image> - <source_tarball_on_stdin>
-	cmd := exec.Command("mkfs.erofs", "--tar=f", dest)
+	// cmd := exec.Command("mkfs.erofs", "--tar=f", "-zlz4hc", "-C4096", "-E", "legacy-compress,noinline_data", dest)
+	tarball := dest
+	tarball += ".tar"
+	writeToFile(r, tarball)
+	cmd := exec.Command("mkfs.erofs", "--tar=i", "-E", "legacy-compress", dest, tarball)
 	cmd.Stdin = r
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
@@ -416,6 +428,20 @@ func (d *Driver) runMkfsErofs(r io.Reader, dest string) error {
 		return fmt.Errorf("mkfs.erofs failed: %w: %s", err, stderr.String())
 	}
 	return nil
+}
+
+func writeToFile(r io.Reader, dstPath string) error {
+	// Create (or truncate) the destination file with appropriate permissions.
+	f, err := os.Create(dstPath)
+	if err != nil {
+		return err
+	}
+	// Ensure the file is closed when we’re done.
+	defer f.Close()
+
+	// Copy the contents from the reader to the file.
+	_, err = io.Copy(f, r)
+	return err
 }
 
 // func (d *Driver) runMkfsErofsWithExtraction(r io.Reader, dest string) error {

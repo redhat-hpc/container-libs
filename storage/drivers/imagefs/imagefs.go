@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/sirupsen/logrus"
@@ -307,8 +308,30 @@ func (d *Driver) ListLayers() ([]string, error) {
 	return nil, fmt.Errorf("ListLayers not implemented")
 }
 
+func (d *Driver) getMkfsErofsVersion() string {
+	cmd := exec.Command("mkfs.erofs", "-V")
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+
+	if err := cmd.Run(); err != nil {
+		return "unknown"
+	}
+
+	output := stdout.String()
+	re := regexp.MustCompile(`(\d+\.\d+\.\d+)`)
+	matches := re.FindStringSubmatch(output)
+	if len(matches) > 1 {
+		return matches[1]
+	}
+
+	return "unknown"
+}
+
 func (d *Driver) Status() [][2]string {
-	return [][2]string{{"driver", "imagefs"}}
+	return [][2]string{
+		{"driver", "imagefs"},
+		{"erofs-utils", d.getMkfsErofsVersion()},
+	}
 }
 
 func (d *Driver) Metadata(id string) (map[string]string, error) {

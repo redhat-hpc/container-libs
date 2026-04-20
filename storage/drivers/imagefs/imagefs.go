@@ -186,7 +186,7 @@ func (d *Driver) Get(id string, options graphdriver.MountOpts) (string, error) {
 func (d *Driver) canUseMergedErofs(layers []string) (bool, error) {
 	for _, layerID := range layers {
 		path := d.getImagePath(layerID)
-		if !kernel.CheckKernelVersion(5, 15, 0) {
+		if !kernel.CheckKernelVersion(5, 14, 0) {
 			return false, nil
 		}
 		if path == "" {
@@ -222,9 +222,20 @@ func (d *Driver) mountLayersSeparately(containerID string, layers []string) ([]s
 
 func (d *Driver) mountErofsMerged(containerID string, layers []string) ([]string, error) {
 	var imagePaths []string
+	var devicePaths []string
 	for _, layerID := range layers {
 		path := d.getImagePath(layerID)
+		if path == "" {
+			return nil, fmt.Errorf("no image file found for layer %s", layerID)
+		}
 		imagePaths = append(imagePaths, path)
+
+		// The device path is the .tar file associated with each image
+		devicePath := path + ".tar"
+		if fileutils.Exists(devicePath) != nil {
+			return nil, fmt.Errorf("no tar device file found for layer %s at %s", layerID, devicePath)
+		}
+		devicePaths = append(devicePaths, devicePath)
 	}
 
 	rundir := d.mm.GetRundir(containerID)
@@ -234,20 +245,12 @@ func (d *Driver) mountErofsMerged(containerID string, layers []string) ([]string
 
 	// mkfs.erofs <dest> <src1> <src2> ...
 	args := append([]string{mergedImagePath}, imagePaths...)
-	cmd := exec.Command("mkfs.erofs", args...)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	logrus.Debugf("[imagefs] Creating merged erofs volume: %v", cmd.Args)
-	if err := cmd.Run(); err != nil {
-		logrus.Debugf("merge error stdout: %s", stdout.String())
-		logrus.Debugf("merge error stderr: %s", stderr.String())
+	if err := d.mm.mounter.RunCommand("mkfs.erofs", args...); err != nil {
 		return nil, fmt.Errorf("failed to merge EROFS layers: %w", err)
 	}
 
 	isRoot := os.Getuid() == 0
-	mountPoint, err := d.mm.MountLayer(containerID, "merged-layers", mergedImagePath, isRoot)
+	mountPoint, err := d.mm.MountLayerWithDevices(containerID, "merged-layers", mergedImagePath, isRoot, devicePaths)
 	if err != nil {
 		return nil, fmt.Errorf("failed to mount merged EROFS image: %w", err)
 	}
@@ -320,10 +323,11 @@ func (d *Driver) getMkfsErofsVersion() string {
 	cmd := exec.Command("mkfs.erofs", "-V")
 	var stdout bytes.Buffer
 	cmd.Stdout = &stdout
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
 
-	if err := cmd.Run(); err != nil {
-		return "unknown"
-	}
+	// we don't care about exit codes because we just need to find the version somewhere
+	cmd.Run()
 
 	output := stdout.String()
 	re := regexp.MustCompile(`(\d+\.\d+\.\d+)`)
@@ -331,6 +335,16 @@ func (d *Driver) getMkfsErofsVersion() string {
 	if len(matches) > 1 {
 		return matches[1]
 	}
+
+	// Try stderr if stdout doesn't have the version
+	output = stderr.String()
+	matches = re.FindStringSubmatch(output)
+	if len(matches) > 1 {
+		return matches[1]
+	}
+
+	logrus.Debugf("mkfs.erofs output: %s", stdout.String())
+	logrus.Debugf("mkfs.erofs error: %s", stderr.String())
 
 	return "unknown"
 }

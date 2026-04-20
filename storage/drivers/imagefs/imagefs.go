@@ -120,37 +120,22 @@ func (d *Driver) Get(id string, options graphdriver.MountOpts) (string, error) {
 		}
 	}()
 
-	// The top-most layer (id) is the writable layer and should not be mounted as a lowerdir.
+	// Separate the requested layer (id) from its parent layers.
+	// The parent layers (everything below id) are always mounted as EROFS lowerdirs.
 	if len(layers) > 0 {
 		layers = layers[:len(layers)-1]
 	}
 
-	// If there are no layers, we need to handle this specially.
-	// The id itself is the writable layer, but it has no parent layers.
-	// In this case, we should mount the writable layer directly without overlay.
-	if len(layers) == 0 {
-		// Mount the writable layer directly
-		imagePath := d.getImagePath(id)
-		if imagePath == "" {
-			return "", fmt.Errorf("no image file found for layer %s", id)
-		}
+	// Check if the requested layer itself has a committed image (data.img).
+	// If it does, it's a committed image layer and its own EROFS image must be
+	// included as the topmost lowerdir so that its content is visible in the
+	// merged view. If it doesn't have a data.img, it's a working container
+	// layer whose writes are captured by the overlay upperdir.
+	idImagePath := d.getImagePath(id)
+	isCommittedLayer := idImagePath != ""
 
-		// For EROFS layers, we also need the .tar device file
-		var devicePaths []string
-		if filepath.Ext(imagePath) == ".img" {
-			devicePath := imagePath + ".tar"
-			if fileutils.Exists(devicePath) == nil {
-				devicePaths = append(devicePaths, devicePath)
-			}
-		}
-
-		isRoot := os.Getuid() == 0
-		mountPoint, err := d.mm.MountLayerWithDevices(containerID, id, imagePath, isRoot, devicePaths)
-		if err != nil {
-			return "", fmt.Errorf("failed to mount layer %s: %w", id, err)
-		}
-		lowerDirs = append(lowerDirs, mountPoint)
-	} else {
+	// Mount parent layers as EROFS lowerdirs.
+	if len(layers) > 0 {
 		// Determine strategy based on whether all layers are EROFS
 		useMerged, err := d.canUseMergedErofs(layers)
 		if err != nil {
@@ -177,6 +162,32 @@ func (d *Driver) Get(id string, options graphdriver.MountOpts) (string, error) {
 				lowerDirs[i], lowerDirs[j] = lowerDirs[j], lowerDirs[i]
 			}
 		}
+	}
+
+	// If the requested layer is a committed image layer, mount its own EROFS
+	// image and prepend it as the topmost lowerdir. This ensures that files
+	// added or deleted (via whiteout devices) by this layer are visible in
+	// the overlay merged view.
+	if isCommittedLayer {
+		var devicePaths []string
+		if filepath.Ext(idImagePath) == ".img" {
+			devicePath := idImagePath + ".tar"
+			if fileutils.Exists(devicePath) == nil {
+				devicePaths = append(devicePaths, devicePath)
+			}
+		}
+
+		isRoot := os.Getuid() == 0
+		mountPoint, err := d.mm.MountLayerWithDevices(containerID, id, idImagePath, isRoot, devicePaths)
+		if err != nil {
+			return "", fmt.Errorf("failed to mount layer %s: %w", id, err)
+		}
+		// Prepend: this layer's content sits on top of its parents.
+		lowerDirs = append([]string{mountPoint}, lowerDirs...)
+	}
+
+	if len(lowerDirs) == 0 {
+		return "", fmt.Errorf("no lower directories found for layer %s", id)
 	}
 
 	lowerdirString := strings.Join(lowerDirs, ":")
@@ -440,29 +451,50 @@ func (d *Driver) Changes(id string, idMappings *idtools.IDMappings, parent strin
 }
 
 func (d *Driver) ApplyDiff(id string, options graphdriver.ApplyDiffOpts) (int64, error) {
-	// To create an immutable image file from a diff stream, we first extract the
-	// diff to a temporary directory to properly handle deletions, then create
-	// the EROFS image from that directory structure.
+	// To properly handle file deletions in EROFS images, we need to extract
+	// the diff tarball to a temporary directory first. This ensures that 
+	// deletion operations (represented as whiteout files in the tar) are
+	// properly preserved in the final EROFS image.
 	layerDir := d.dir(id)
-	tempDir, err := ioutil.TempDir(layerDir, "diff-")
+	tempDir, err := os.MkdirTemp(layerDir, "diff-")
 	if err != nil {
 		return 0, err
 	}
 	defer os.RemoveAll(tempDir)
 
-	// Extract the diff to temp directory to properly handle deletions
-	if err := archive.Untar(options.Diff, tempDir, &archive.TarOptions{
-		UIDMaps: options.UIDMaps,
-		GIDMaps: options.GIDMaps,
-		// Use the same whiteout format as overlay to ensure proper deletion handling
+	// Extract the diff tarball to temp directory to properly handle deletions
+	// This ensures that whiteout files (representing deletions) are correctly 
+	// processed and that deleted files don't appear in the final EROFS image
+	tarOptions := &archive.TarOptions{
+		// Use overlay whiteout format to ensure proper deletion handling
 		WhiteoutFormat: archive.OverlayWhiteoutFormat,
-	}); err != nil {
+	}
+	
+	// Set ID mappings if provided
+	if options.Mappings != nil {
+		tarOptions.UIDMaps = options.Mappings.UIDs()
+		tarOptions.GIDMaps = options.Mappings.GIDs()
+	}
+	
+	if err := archive.Untar(options.Diff, tempDir, tarOptions); err != nil {
 		return 0, err
 	}
 
-	// Create image file from the properly extracted directory
+	// Create image file from the properly extracted directory structure
+	// This preserves the correct filesystem state including deletions
 	imagePath := filepath.Join(layerDir, "data.img")
-	if err := d.createImageFileFromDirectory(tempDir, imagePath); err != nil {
+	
+	// Create a tar from the directory and pass it to mkfs.erofs for image creation
+	// This preserves the directory structure with deletions properly represented
+	archive, err := archive.TarWithOptions(tempDir, &archive.TarOptions{
+		Compression: archive.Uncompressed,
+	})
+	if err != nil {
+		return 0, err
+	}
+	defer archive.Close()
+	
+	if err := d.runMkfsErofs(archive, imagePath); err != nil {
 		return 0, fmt.Errorf("failed to create image file %s: %w", imagePath, err)
 	}
 
@@ -475,47 +507,15 @@ func (d *Driver) ApplyDiff(id string, options graphdriver.ApplyDiffOpts) (int64,
 	return info.Size(), nil
 }
 
-func (d *Driver) createImageFile(r io.Reader, destFile string) error {
-	return d.runMkfsErofs(r, destFile)
-}
-
-// createImageFileFromDirectory creates an EROFS image from a directory structure
-// This properly handles deletions that would be represented as whiteout files in the tar
-func (d *Driver) createImageFileFromDirectory(sourceDir, destFile string) error {
-	// Create a temporary tar from the directory to feed to mkfs.erofs
-	// This ensures proper handling of deletions that were represented as
-	// whiteout files in the original tar stream
-	cmd := exec.Command("mkfs.erofs", "-t", "tar", destFile, "-")
-	cmd.Dir = sourceDir
-	cmd.Stdin = nil // This will be handled by mkfs.erofs reading from the directory
-
-	// Instead, we'll use a different approach - pipe the directory directly to mkfs.erofs
-	// But since mkfs.erofs doesn't directly support directory input, we'll create a tar
-	// from the directory and pipe it to mkfs.erofs
-	
-	// First, create a tar of the directory contents (including deletions properly represented)
-	archive, err := archive.TarWithOptions(sourceDir, &archive.TarOptions{
-		Compression: archive.Uncompressed,
-		// We don't need UID/GID maps since we're just creating a tar for mkfs.erofs
-		// which will handle the filesystem representation directly from the directory
-	})
-	if err != nil {
-		return err
-	}
-	defer archive.Close()
-
-	// Now pipe the tar to mkfs.erofs
-	return d.runMkfsErofs(archive, destFile)
-}
-
 func (d *Driver) runMkfsErofs(r io.Reader, dest string) error {
-	// mkfs.erofs -t tar <dest_image> - <source_tarball_on_stdin>
-	// cmd := exec.Command("mkfs.erofs", "--tar=f", "-zlz4hc", "-C4096", "-E", "legacy-compress,noinline_data", dest)
-	tarball := dest
-	tarball += ".tar"
-	writeToFile(r, tarball)
+	// Write the tar stream to a file so mkfs.erofs can use it as both the
+	// filesystem source (--tar=i) and the backing data device (.tar file).
+	tarball := dest + ".tar"
+	if err := writeToFile(r, tarball); err != nil {
+		return fmt.Errorf("failed to write tarball %s: %w", tarball, err)
+	}
+
 	cmd := exec.Command("mkfs.erofs", "--tar=i", "-E", "legacy-compress", dest, tarball)
-	cmd.Stdin = r
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 

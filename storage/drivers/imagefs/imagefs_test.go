@@ -246,6 +246,57 @@ func TestDriver_Get_Diff(t *testing.T) {
 	arch.Close()
 }
 
+func TestDriver_Get_WorkingContainerLayer(t *testing.T) {
+	// Tests that a working container layer (no data.img) uses the overlay
+	// upperdir for writes, while still seeing committed parent layers.
+	// This is the case during a RUN step in podman build.
+	tmpDir := t.TempDir()
+	runRoot := t.TempDir()
+
+	mockMounter := new(MockMounter)
+	d := &Driver{
+		home:    tmpDir,
+		runRoot: runRoot,
+		mm: &MountManager{
+			runRoot: runRoot,
+			mounter: mockMounter,
+		},
+	}
+
+	// Setup: base layer (committed, has data.img) and a container layer (no data.img)
+	baseLayer := "base"
+	baseDir := filepath.Join(tmpDir, baseLayer)
+	os.MkdirAll(baseDir, 0755)
+	os.WriteFile(filepath.Join(baseDir, "data.img"), []byte("busybox"), 0644)
+	os.WriteFile(filepath.Join(baseDir, "data.img.tar"), []byte("busybox-tar"), 0644)
+
+	containerLayer := "container1"
+	containerDir := filepath.Join(tmpDir, containerLayer)
+	os.MkdirAll(containerDir, 0755)
+	os.WriteFile(filepath.Join(containerDir, "parent"), []byte(baseLayer), 0644)
+	// NO data.img — this is a working container layer
+
+	mockMounter.On("RunCommand", mock.Anything, mock.Anything).Return(nil)
+	mockMounter.On("Mount", mock.Anything, mock.Anything, "erofs", mock.Anything).Return(nil)
+	mockMounter.On("Mount", "overlay", mock.Anything, "overlay", mock.Anything).Return(nil)
+	mockMounter.On("LazyUnmount", mock.Anything).Return(nil)
+
+	mergedDir, err := d.Get(containerLayer, graphdriver.MountOpts{})
+	assert.NoError(t, err)
+	assert.Contains(t, mergedDir, "merged")
+
+	// Verify that the overlay mount was called.
+	// The container layer should NOT have its own EROFS mount (no data.img),
+	// so only the base layer's EROFS is a lowerdir, and container1/upper is the upperdir.
+	overlayCall := mockMounter.Calls[len(mockMounter.Calls)-1]
+	assert.Equal(t, "Mount", overlayCall.Method)
+	overlayOpts := overlayCall.Arguments.Get(3).(string)
+	// The overlay options should have upperdir=container1/upper
+	assert.Contains(t, overlayOpts, filepath.Join(containerDir, "upper"))
+	// The lowerdir should NOT contain a mount for containerLayer itself
+	assert.NotContains(t, overlayOpts, filepath.Join(runRoot, "imagefs", containerLayer, containerLayer))
+}
+
 func TestDriver_Get_DockerfileScenario(t *testing.T) {
 	tmpDir := t.TempDir()
 	runRoot := t.TempDir()

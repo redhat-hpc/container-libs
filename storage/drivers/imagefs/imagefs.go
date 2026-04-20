@@ -23,10 +23,11 @@ import (
 const parentFileName = "parent"
 
 type Driver struct {
-	home    string
-	runRoot string
-	options Options
-	mm      *MountManager
+	home     string
+	runRoot  string
+	options  Options
+	mm       *MountManager
+	naiveDiff graphdriver.DiffDriver
 }
 
 func Init(home string, options graphdriver.Options) (graphdriver.Driver, error) {
@@ -35,12 +36,14 @@ func Init(home string, options graphdriver.Options) (graphdriver.Driver, error) 
 		return nil, err
 	}
 
-	return &Driver{
-		home:    home,
-		runRoot: options.RunRoot,
-		options: *opts,
-		mm:      NewMountManager(options.RunRoot, nil),
-	}, nil
+	d := &Driver{
+		home:     home,
+		runRoot:  options.RunRoot,
+		options:  *opts,
+		mm:       NewMountManager(options.RunRoot, nil),
+	}
+	d.naiveDiff = graphdriver.NewNaiveDiffDriver(d, graphdriver.NewNaiveLayerIDMapUpdater(d))
+	return d, nil
 }
 
 func init() {
@@ -122,8 +125,31 @@ func (d *Driver) Get(id string, options graphdriver.MountOpts) (string, error) {
 		layers = layers[:len(layers)-1]
 	}
 
+	// If there are no layers, we need to handle this specially.
+	// The id itself is the writable layer, but it has no parent layers.
+	// In this case, we should mount the writable layer directly without overlay.
 	if len(layers) == 0 {
-		lowerDirs = []string{}
+		// Mount the writable layer directly
+		imagePath := d.getImagePath(id)
+		if imagePath == "" {
+			return "", fmt.Errorf("no image file found for layer %s", id)
+		}
+
+		// For EROFS layers, we also need the .tar device file
+		var devicePaths []string
+		if filepath.Ext(imagePath) == ".img" {
+			devicePath := imagePath + ".tar"
+			if fileutils.Exists(devicePath) == nil {
+				devicePaths = append(devicePaths, devicePath)
+			}
+		}
+
+		isRoot := os.Getuid() == 0
+		mountPoint, err := d.mm.MountLayerWithDevices(containerID, id, imagePath, isRoot, devicePaths)
+		if err != nil {
+			return "", fmt.Errorf("failed to mount layer %s: %w", id, err)
+		}
+		lowerDirs = append(lowerDirs, mountPoint)
 	} else {
 		// Determine strategy based on whether all layers are EROFS
 		useMerged, err := d.canUseMergedErofs(layers)
@@ -406,19 +432,37 @@ func (d *Driver) Dedup(args graphdriver.DedupArgs) (graphdriver.DedupResult, err
 // --- DiffDriver implementation ---
 
 func (d *Driver) Diff(id string, idMappings *idtools.IDMappings, parent string, parentIDMappings *idtools.IDMappings, mountLabel string) (io.ReadCloser, error) {
-	return nil, fmt.Errorf("Diff not implemented")
+	return d.naiveDiff.Diff(id, idMappings, parent, parentIDMappings, mountLabel)
 }
 
 func (d *Driver) Changes(id string, idMappings *idtools.IDMappings, parent string, parentIDMappings *idtools.IDMappings, mountLabel string) ([]archive.Change, error) {
-	return nil, fmt.Errorf("Changes not implemented")
+	return d.naiveDiff.Changes(id, idMappings, parent, parentIDMappings, mountLabel)
 }
 
 func (d *Driver) ApplyDiff(id string, options graphdriver.ApplyDiffOpts) (int64, error) {
-	// To create an immutable image file from a diff stream, we pipe the tarball
-	// stream directly into mkfs.erofs via stdin.
-	imagePath := filepath.Join(d.dir(id), "data.img")
+	// To create an immutable image file from a diff stream, we first extract the
+	// diff to a temporary directory to properly handle deletions, then create
+	// the EROFS image from that directory structure.
+	layerDir := d.dir(id)
+	tempDir, err := ioutil.TempDir(layerDir, "diff-")
+	if err != nil {
+		return 0, err
+	}
+	defer os.RemoveAll(tempDir)
 
-	if err := d.createImageFile(options.Diff, imagePath); err != nil {
+	// Extract the diff to temp directory to properly handle deletions
+	if err := archive.Untar(options.Diff, tempDir, &archive.TarOptions{
+		UIDMaps: options.UIDMaps,
+		GIDMaps: options.GIDMaps,
+		// Use the same whiteout format as overlay to ensure proper deletion handling
+		WhiteoutFormat: archive.OverlayWhiteoutFormat,
+	}); err != nil {
+		return 0, err
+	}
+
+	// Create image file from the properly extracted directory
+	imagePath := filepath.Join(layerDir, "data.img")
+	if err := d.createImageFileFromDirectory(tempDir, imagePath); err != nil {
 		return 0, fmt.Errorf("failed to create image file %s: %w", imagePath, err)
 	}
 
@@ -433,6 +477,35 @@ func (d *Driver) ApplyDiff(id string, options graphdriver.ApplyDiffOpts) (int64,
 
 func (d *Driver) createImageFile(r io.Reader, destFile string) error {
 	return d.runMkfsErofs(r, destFile)
+}
+
+// createImageFileFromDirectory creates an EROFS image from a directory structure
+// This properly handles deletions that would be represented as whiteout files in the tar
+func (d *Driver) createImageFileFromDirectory(sourceDir, destFile string) error {
+	// Create a temporary tar from the directory to feed to mkfs.erofs
+	// This ensures proper handling of deletions that were represented as
+	// whiteout files in the original tar stream
+	cmd := exec.Command("mkfs.erofs", "-t", "tar", destFile, "-")
+	cmd.Dir = sourceDir
+	cmd.Stdin = nil // This will be handled by mkfs.erofs reading from the directory
+
+	// Instead, we'll use a different approach - pipe the directory directly to mkfs.erofs
+	// But since mkfs.erofs doesn't directly support directory input, we'll create a tar
+	// from the directory and pipe it to mkfs.erofs
+	
+	// First, create a tar of the directory contents (including deletions properly represented)
+	archive, err := archive.TarWithOptions(sourceDir, &archive.TarOptions{
+		Compression: archive.Uncompressed,
+		// We don't need UID/GID maps since we're just creating a tar for mkfs.erofs
+		// which will handle the filesystem representation directly from the directory
+	})
+	if err != nil {
+		return err
+	}
+	defer archive.Close()
+
+	// Now pipe the tar to mkfs.erofs
+	return d.runMkfsErofs(archive, destFile)
 }
 
 func (d *Driver) runMkfsErofs(r io.Reader, dest string) error {
@@ -496,7 +569,7 @@ func writeToFile(r io.Reader, dstPath string) error {
 // }
 
 func (d *Driver) DiffSize(id string, idMappings *idtools.IDMappings, parent string, parentIDMappings *idtools.IDMappings, mountLabel string) (int64, error) {
-	return 0, fmt.Errorf("DiffSize not implemented")
+	return d.naiveDiff.DiffSize(id, idMappings, parent, parentIDMappings, mountLabel)
 }
 
 // --- LayerIDMapUpdater implementation ---

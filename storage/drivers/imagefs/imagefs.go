@@ -210,8 +210,17 @@ func (d *Driver) mountLayersSeparately(containerID string, layers []string) ([]s
 			return nil, fmt.Errorf("no image file found for layer %s", layerID)
 		}
 
+		// For EROFS layers, we also need the .tar device file
+		var devicePaths []string
+		if filepath.Ext(imagePath) == ".img" {
+			devicePath := imagePath + ".tar"
+			if fileutils.Exists(devicePath) == nil {
+				devicePaths = append(devicePaths, devicePath)
+			}
+		}
+
 		isRoot := os.Getuid() == 0
-		mountPoint, err := d.mm.MountLayer(containerID, layerID, imagePath, isRoot)
+		mountPoint, err := d.mm.MountLayerWithDevices(containerID, layerID, imagePath, isRoot, devicePaths)
 		if err != nil {
 			return nil, fmt.Errorf("failed to mount layer %s: %w", layerID, err)
 		}

@@ -63,6 +63,10 @@ func (m *MountManager) GetRundir(containerID string) string {
 }
 
 func (m *MountManager) MountLayer(containerID, layerID, imagePath string, isRoot bool) (string, error) {
+	return m.MountLayerWithDevices(containerID, layerID, imagePath, isRoot, nil)
+}
+
+func (m *MountManager) MountLayerWithDevices(containerID, layerID, imagePath string, isRoot bool, devices []string) (string, error) {
 	rundir := m.GetRundir(containerID)
 	layerDir := filepath.Join(rundir, layerID)
 
@@ -89,7 +93,7 @@ func (m *MountManager) MountLayer(containerID, layerID, imagePath string, isRoot
 	}
 
 	// Rootless path: Use FUSE mounts.
-	if err := m.mountRootless(imagePath, layerDir); err != nil {
+	if err := m.mountRootlessWithDevices(imagePath, layerDir, devices); err != nil {
 		return "", fmt.Errorf("rootless mount failed for layer %s: %w", layerID, err)
 	}
 
@@ -114,6 +118,10 @@ func (m *MountManager) mountRoot(source, target string) error {
 }
 
 func (m *MountManager) mountRootless(source, target string) error {
+	return m.mountRootlessWithDevices(source, target, nil)
+}
+
+func (m *MountManager) mountRootlessWithDevices(source, target string, devices []string) error {
 	var cmdName string
 	if filepath.Ext(source) == ".sqsh" {
 		cmdName = "squashfuse"
@@ -121,12 +129,19 @@ func (m *MountManager) mountRootless(source, target string) error {
 		cmdName = "erofsfuse"
 	}
 
-	logrus.Debugf("[imagefs] Rootless mounting layer via %s: %s -> %s", cmdName, source, target)
-	// Use -o allow_other,default_permissions to prevent permission denied errors for container processes.
-	// 'allow_other' allows other users to access the mount.
-	// 'default_permissions' tells FUSE to use the kernel's standard permission checks.
-	// Note: This requires /etc/fuse.conf to have 'user_allow_other' enabled.
-	if err := m.mounter.RunCommand(cmdName, "-o", "allow_other,default_permissions", source, target); err != nil {
+	args := []string{"-o", "allow_other,default_permissions", source, target}
+
+	// Add device arguments before the source
+	if len(devices) > 0 {
+		deviceArgs := []string{}
+		for _, device := range devices {
+			deviceArgs = append(deviceArgs, "--device="+device)
+		}
+		args = append(deviceArgs, args...)
+	}
+
+	logrus.Debugf("[imagefs] Rootless mounting layer via %s: %s -> %s (devices: %v)", cmdName, source, target, devices)
+	if err := m.mounter.RunCommand(cmdName, args...); err != nil {
 		return fmt.Errorf("rootless mount failed: %w", err)
 	}
 	return nil

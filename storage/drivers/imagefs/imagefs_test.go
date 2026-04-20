@@ -61,17 +61,11 @@ func TestDriver_Get(t *testing.T) {
 				os.WriteFile(filepath.Join(dir, "parent"), []byte(layers[i+1]), 0644)
 			}
 			os.WriteFile(filepath.Join(dir, "data.img"), []byte("dummy"), 0644)
+			os.WriteFile(filepath.Join(dir, "data.img.tar"), []byte("dummy-tar"), 0644)
 		}
 
-		// Mock mkfs.erofs call
-		mockMounter.On("RunCommand", mock.MatchedBy(func(args []string) bool {
-			return args[0] == "mkfs.erofs"
-		})).Return(nil)
-
-		// Mock erofsfuse call (used by MountLayer in rootless mode)
-		mockMounter.On("RunCommand", mock.MatchedBy(func(args []string) bool {
-			return args[0] == "erofsfuse"
-		})).Return(nil)
+		// Mock all RunCommand calls including mkfs.erofs
+		mockMounter.On("RunCommand", mock.Anything, mock.Anything).Return(nil)
 
 		mockMounter.On("Mount", mock.Anything, mock.Anything, "erofs", mock.Anything).Return(nil)
 		mockMounter.On("Mount", "overlay", mock.Anything, "overlay", mock.Anything).Return(nil)

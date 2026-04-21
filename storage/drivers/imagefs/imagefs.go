@@ -82,7 +82,42 @@ func (d *Driver) createLayer(id, parent string) error {
 }
 
 func (d *Driver) CreateFromTemplate(id, template string, templateIDMappings *idtools.IDMappings, parent string, parentIDMappings *idtools.IDMappings, opts *graphdriver.CreateOpts, readWrite bool) error {
-	return fmt.Errorf("CreateFromTemplate not implemented")
+	// CreateFromTemplate creates a new layer based on a template layer with different ID mappings.
+	// For imagefs, since EROFS images are immutable and already have fixed UIDs/GIDs,
+	// we create symlinks to the template's image files rather than copying them.
+	if readWrite {
+		return d.CreateReadWrite(id, template, opts)
+	}
+
+	// Create the layer directory and parent file
+	if err := d.Create(id, template, opts); err != nil {
+		return err
+	}
+
+	// For read-only template layers, create symlinks to the template's EROFS image files.
+	// This avoids copying immutable data while allowing the layer to reference the template.
+	templateImagePath := d.getImagePath(template)
+	if templateImagePath != "" {
+		layerDir := d.dir(id)
+		ext := filepath.Ext(templateImagePath)
+
+		// Symlink the EROFS image
+		targetImage := filepath.Join(layerDir, "layer"+ext)
+		if err := os.Symlink(templateImagePath, targetImage); err != nil {
+			return fmt.Errorf("failed to symlink template image: %w", err)
+		}
+
+		// Symlink the tarball if it exists
+		templateTarball := templateImagePath + ".tar"
+		if fileutils.Exists(templateTarball) == nil {
+			targetTarball := targetImage + ".tar"
+			if err := os.Symlink(templateTarball, targetTarball); err != nil {
+				return fmt.Errorf("failed to symlink template tarball: %w", err)
+			}
+		}
+	}
+
+	return nil
 }
 
 func (d *Driver) Remove(id string) error {
@@ -121,10 +156,10 @@ func (d *Driver) Get(id string, options graphdriver.MountOpts) (string, error) {
 		}
 	}()
 
-	// Check if the requested layer itself has a committed image (data.img).
+	// Check if the requested layer itself has a committed image (layer.erofs).
 	// If it does, it's a committed image layer and its own EROFS image must be
 	// included as the topmost lowerdir so that its content is visible in the
-	// merged view. If it doesn't have a data.img, it's a working container
+	// merged view. If it doesn't have a layer.erofs, it's a working container
 	// layer whose writes are captured by the overlay upperdir.
 	idImagePath := d.getImagePath(id)
 	isCommittedLayer := idImagePath != ""
@@ -135,7 +170,7 @@ func (d *Driver) Get(id string, options graphdriver.MountOpts) (string, error) {
 	isReadOnly := slices.Contains(options.Options, "ro")
 	if isReadOnly && isCommittedLayer {
 		var devicePaths []string
-		if filepath.Ext(idImagePath) == ".img" {
+		if filepath.Ext(idImagePath) == ".erofs" {
 			devicePath := idImagePath + ".tar"
 			if fileutils.Exists(devicePath) == nil {
 				devicePaths = append(devicePaths, devicePath)
@@ -192,7 +227,7 @@ func (d *Driver) Get(id string, options graphdriver.MountOpts) (string, error) {
 	// the overlay merged view.
 	if isCommittedLayer {
 		var devicePaths []string
-		if filepath.Ext(idImagePath) == ".img" {
+		if filepath.Ext(idImagePath) == ".erofs" {
 			devicePath := idImagePath + ".tar"
 			if fileutils.Exists(devicePath) == nil {
 				devicePaths = append(devicePaths, devicePath)
@@ -251,7 +286,7 @@ func (d *Driver) canUseMergedErofs(layers []string) (bool, error) {
 		if path == "" {
 			return false, fmt.Errorf("no image file found for layer %s", layerID)
 		}
-		if filepath.Ext(path) != ".img" {
+		if filepath.Ext(path) != ".erofs" {
 			return false, nil // At least one layer is not EROFS
 		}
 		if len(layers) == 1 {
@@ -271,7 +306,7 @@ func (d *Driver) mountLayersSeparately(containerID string, layers []string) ([]s
 
 		// For EROFS layers, we also need the .tar device file
 		var devicePaths []string
-		if filepath.Ext(imagePath) == ".img" {
+		if filepath.Ext(imagePath) == ".erofs" {
 			// Try .erofs.tar first (new format), fall back to .tar (backward compatibility)
 			devicePath := imagePath + ".erofs.tar"
 			if fileutils.Exists(devicePath) != nil {
@@ -313,7 +348,7 @@ func (d *Driver) mountErofsMerged(containerID string, layers []string) ([]string
 	rundir := d.mm.GetRundir(containerID)
 	os.MkdirAll(rundir, 0o755)
 
-	mergedImagePath := filepath.Join(rundir, "merged_layers.img")
+	mergedImagePath := filepath.Join(rundir, "merged_layers.erofs")
 
 	// mkfs.erofs <dest> <src1> <src2> ...
 	args := append([]string{mergedImagePath}, imagePaths...)
@@ -365,11 +400,11 @@ func (d *Driver) getLayerStack(id string) ([]string, error) {
 
 func (d *Driver) getImagePath(id string) string {
 	// In our updated layout, the image file is stored inside the layer directory:
-	// /home/.../storage/imagefs/<id>/data.img
+	// /home/.../storage/imagefs/<id>/layer.erofs
 
-	extensions := []string{".img", ".sqsh"}
+	extensions := []string{".erofs", ".sqsh"}
 	for _, ext := range extensions {
-		img := filepath.Join(d.dir(id), "data"+ext)
+		img := filepath.Join(d.dir(id), "layer"+ext)
 		if fileutils.Exists(img) == nil {
 			return img
 		}
@@ -440,7 +475,7 @@ func (d *Driver) Metadata(id string) (map[string]string, error) {
 	meta["path"] = path
 
 	// Determine the format
-	if filepath.Ext(path) == ".img" {
+	if filepath.Ext(path) == ".erofs" {
 		meta["format"] = "erofs"
 	} else if filepath.Ext(path) == ".sqsh" {
 		meta["format"] = "squashfs"
@@ -471,13 +506,13 @@ func (d *Driver) Dedup(args graphdriver.DedupArgs) (graphdriver.DedupResult, err
 // --- DiffDriver implementation ---
 
 func (d *Driver) Diff(id string, idMappings *idtools.IDMappings, parent string, parentIDMappings *idtools.IDMappings, mountLabel string) (io.ReadCloser, error) {
-	// For committed image layers, we have the original tarball stored as data.img.tar.
+	// For committed image layers, we have the original tarball stored as layer.erofs.tar.
 	// When exporting a layer with no parent (i.e., the full layer content), we should
 	// return the original tarball instead of mounting the EROFS image and re-tarballing,
 	// because the re-tarball process can produce different content/digests.
 	if parent == "" {
 		imagePath := d.getImagePath(id)
-		if imagePath != "" && filepath.Ext(imagePath) == ".img" {
+		if imagePath != "" && filepath.Ext(imagePath) == ".erofs" {
 			tarballPath := imagePath + ".tar"
 			if fileutils.Exists(tarballPath) == nil {
 				logrus.Debugf("[imagefs] Returning original tarball for layer %s: %s", id, tarballPath)
@@ -500,7 +535,7 @@ func (d *Driver) Changes(id string, idMappings *idtools.IDMappings, parent strin
 
 func (d *Driver) ApplyDiff(id string, options graphdriver.ApplyDiffOpts) (int64, error) {
 	layerDir := d.dir(id)
-	imagePath := filepath.Join(layerDir, "data.img")
+	imagePath := filepath.Join(layerDir, "layer.erofs")
 	tarballPath := imagePath + ".tar"
 
 	// Save the original tarball - this is what tar-split will use

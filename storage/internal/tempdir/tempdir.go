@@ -268,11 +268,6 @@ func (td *TempDir) Cleanup() error {
 	return lock.UnlockAndDelete()
 }
 
-// Path returns the path to the temporary directory.
-func (td *TempDir) Path() string {
-	return td.tempDirPath
-}
-
 // CleanupTemporaryDirectories cleans up multiple temporary directories by calling their cleanup functions.
 func CleanupTemporaryDirectories(cleanFuncs ...CleanupTempDirFunc) error {
 	var cleanupErrors []error

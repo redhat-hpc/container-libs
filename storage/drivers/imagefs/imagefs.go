@@ -28,6 +28,7 @@ type Driver struct {
 	runRoot   string
 	options   Options
 	mm        *MountManager
+	syncMode  graphdriver.SyncMode
 	naiveDiff graphdriver.DiffDriver
 }
 
@@ -38,10 +39,11 @@ func Init(home string, options graphdriver.Options) (graphdriver.Driver, error) 
 	}
 
 	d := &Driver{
-		home:    home,
-		runRoot: options.RunRoot,
-		options: *opts,
-		mm:      NewMountManager(options.RunRoot, nil),
+		home:     home,
+		runRoot:  options.RunRoot,
+		options:  *opts,
+		mm:       NewMountManager(options.RunRoot, nil),
+		syncMode: graphdriver.SyncModeNone, // Default to no sync
 	}
 	d.naiveDiff = graphdriver.NewNaiveDiffDriver(d, graphdriver.NewNaiveLayerIDMapUpdater(d))
 	return d, nil
@@ -55,6 +57,10 @@ func init() {
 
 func (d *Driver) String() string {
 	return "imagefs"
+}
+
+func (d *Driver) SyncMode() graphdriver.SyncMode {
+	return d.syncMode
 }
 
 func (d *Driver) CreateReadWrite(id, parent string, opts *graphdriver.CreateOpts) error {
@@ -164,10 +170,12 @@ func (d *Driver) Get(id string, options graphdriver.MountOpts) (string, error) {
 	idImagePath := d.getImagePath(id)
 	isCommittedLayer := idImagePath != ""
 
+	isReadOnly := slices.Contains(options.Options, "ro")
+	logrus.Debugf("[imagefs] Get(%s): layers=%d, isCommitted=%v, isReadOnly=%v, options=%v", id, len(layers), isCommittedLayer, isReadOnly, options.Options)
+
 	// If this is a read-only mount request for a committed layer, just mount
 	// the layer directly without overlay. This is important for tar-split
 	// reconstruction which needs to read the exact original layer content.
-	isReadOnly := slices.Contains(options.Options, "ro")
 	if isReadOnly && isCommittedLayer {
 		var devicePaths []string
 		if filepath.Ext(idImagePath) == ".erofs" {
@@ -352,10 +360,14 @@ func (d *Driver) mountErofsMerged(containerID string, layers []string) ([]string
 
 	// mkfs.erofs <dest> <src1> <src2> ...
 	args := append([]string{mergedImagePath}, imagePaths...)
+	logrus.Debugf("[imagefs] Creating merged EROFS: mkfs.erofs %v", args)
 	if err := d.mm.mounter.RunCommand("mkfs.erofs", args...); err != nil {
 		return nil, fmt.Errorf("failed to merge EROFS layers: %w", err)
 	}
 
+	// When mounting the merged EROFS, we need to pass all the original
+	// device paths so erofsfuse can access the device files (including whiteouts)
+	// that were stored separately in the .tar files
 	isRoot := os.Getuid() == 0
 	mountPoint, err := d.mm.MountLayerWithDevices(containerID, "merged-layers", mergedImagePath, isRoot, devicePaths)
 	if err != nil {
@@ -506,13 +518,14 @@ func (d *Driver) Dedup(args graphdriver.DedupArgs) (graphdriver.DedupResult, err
 // --- DiffDriver implementation ---
 
 func (d *Driver) Diff(id string, idMappings *idtools.IDMappings, parent string, parentIDMappings *idtools.IDMappings, mountLabel string) (io.ReadCloser, error) {
-	// For committed image layers, we have the original tarball stored as layer.erofs.tar.
-	// When exporting a layer with no parent (i.e., the full layer content), we should
-	// return the original tarball instead of mounting the EROFS image and re-tarballing,
-	// because the re-tarball process can produce different content/digests.
-	if parent == "" {
-		imagePath := d.getImagePath(id)
-		if imagePath != "" && filepath.Ext(imagePath) == ".erofs" {
+	// Check if this is a committed image layer or a working container layer
+	imagePath := d.getImagePath(id)
+	isCommittedLayer := imagePath != ""
+
+	// For committed image layers with no parent, return the original tarball.
+	// This ensures tar-split reconstruction produces the correct digest.
+	if parent == "" && isCommittedLayer {
+		if filepath.Ext(imagePath) == ".erofs" {
 			tarballPath := imagePath + ".tar"
 			if fileutils.Exists(tarballPath) == nil {
 				logrus.Debugf("[imagefs] Returning original tarball for layer %s: %s", id, tarballPath)
@@ -525,7 +538,26 @@ func (d *Driver) Diff(id string, idMappings *idtools.IDMappings, parent string, 
 		}
 	}
 
-	// For layers with parents or layers without a tarball, fall back to naive diff
+	// For working container layers (no layer.erofs), tar the upperdir directly.
+	// This avoids the device/inode mismatch problem when naiveDiff creates
+	// overlay mounts for both the layer and its parent.
+	if !isCommittedLayer {
+		upperdir := filepath.Join(d.dir(id), "upper")
+		logrus.Debugf("[imagefs] Tarring upperdir for working layer %s: %s", id, upperdir)
+
+		if idMappings == nil {
+			idMappings = &idtools.IDMappings{}
+		}
+
+		return archive.TarWithOptions(upperdir, &archive.TarOptions{
+			Compression:    archive.Uncompressed,
+			UIDMaps:        idMappings.UIDs(),
+			GIDMaps:        idMappings.GIDs(),
+			WhiteoutFormat: archive.OverlayWhiteoutFormat,
+		})
+	}
+
+	// For committed layers with parents, fall back to naive diff
 	return d.naiveDiff.Diff(id, idMappings, parent, parentIDMappings, mountLabel)
 }
 
@@ -551,13 +583,14 @@ func (d *Driver) ApplyDiff(id string, options graphdriver.ApplyDiffOpts) (int64,
 		return 0, fmt.Errorf("failed to create image file %s: %w", imagePath, err)
 	}
 
-	info, err := os.Stat(imagePath)
+	// Return the tarball size, not the EROFS image size
+	tarInfo, err := os.Stat(tarballPath)
 	if err != nil {
-		return 0, fmt.Errorf("failed to stat resulting image file: %w", err)
+		return 0, fmt.Errorf("failed to stat tarball: %w", err)
 	}
 
-	logrus.Debugf("[imagefs] layer %s wrote %d bytes", imagePath, info.Size())
-	return info.Size(), nil
+	logrus.Debugf("[imagefs] layer %s: tarball size %d bytes", id, tarInfo.Size())
+	return tarInfo.Size(), nil
 }
 
 func (d *Driver) runMkfsErofs(tarballPath, dest string) error {

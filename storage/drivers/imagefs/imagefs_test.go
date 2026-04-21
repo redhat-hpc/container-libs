@@ -69,7 +69,7 @@ func TestDriver_Get(t *testing.T) {
 
 		mockMounter.On("Mount", mock.Anything, mock.Anything, "erofs", mock.Anything).Return(nil)
 		mockMounter.On("Mount", "overlay", mock.Anything, "overlay", mock.Anything).Return(nil)
-		
+
 		// Mock cleanup calls
 		mockMounter.On("LazyUnmount", mock.Anything).Return(nil)
 
@@ -108,9 +108,9 @@ func TestDriver_Get(t *testing.T) {
 		mockMounter.On("RunCommand", mock.MatchedBy(func(args []string) bool {
 			return args[0] == "erofsfuse" || args[0] == "squashfuse"
 		})).Return(nil)
-		
+
 		mockMounter.On("Mount", "overlay", mock.Anything, "overlay", mock.Anything).Return(nil)
-		
+
 		// Mock cleanup calls
 		mockMounter.On("LazyUnmount", mock.Anything).Return(nil)
 
@@ -123,7 +123,7 @@ func TestDriver_Get(t *testing.T) {
 func TestDriver_Put(t *testing.T) {
 	tmpDir := t.TempDir()
 	runRoot := t.TempDir()
-	
+
 	mockMounter := new(MockMounter)
 	d := &Driver{
 		home:    tmpDir,
@@ -142,7 +142,7 @@ func TestDriver_Put(t *testing.T) {
 
 	err := d.Put("L1")
 	assert.NoError(t, err)
-	
+
 	mockMounter.AssertExpectations(t)
 }
 
@@ -173,17 +173,17 @@ func TestDriver_Get_EmptyLayers(t *testing.T) {
 
 	// Mock EROFS mount for the base layer
 	mockMounter.On("Mount", mock.Anything, mock.Anything, "erofs", mock.Anything).Return(nil)
-	
+
 	// Mock overlay mount with the base layer as lowerdir
 	mockMounter.On("Mount", "overlay", mock.Anything, "overlay", mock.Anything).Return(nil)
-	
+
 	// Mock cleanup calls
 	mockMounter.On("LazyUnmount", mock.Anything).Return(nil)
 
 	mergedDir, err := d.Get(layerID, graphdriver.MountOpts{})
 	assert.NoError(t, err)
 	assert.Contains(t, mergedDir, "merged")
-	
+
 	// Verify that the overlay mount was called with a valid lowerdir
 	mockMounter.AssertCalled(t, "Mount", "overlay", mock.Anything, "overlay", mock.Anything)
 }
@@ -193,21 +193,21 @@ func TestDriver_Get_Diff(t *testing.T) {
 	runRoot := t.TempDir()
 
 	mockMounter := new(MockMounter)
-	
+
 	// Create the driver using Init so naiveDiff is properly set up
 	d, err := Init(tmpDir, graphdriver.Options{
-		RunRoot: runRoot,
+		RunRoot:       runRoot,
 		DriverOptions: []string{},
 	})
 	assert.NoError(t, err)
-	
+
 	// Replace the MountManager with our mock
 	imagefsDriver := d.(*Driver)
 	imagefsDriver.mm = &MountManager{
 		runRoot: runRoot,
 		mounter: mockMounter,
 	}
-	
+
 	// Reset naiveDiff to use the mock MountManager
 	imagefsDriver.naiveDiff = graphdriver.NewNaiveDiffDriver(imagefsDriver, graphdriver.NewNaiveLayerIDMapUpdater(imagefsDriver))
 
@@ -228,10 +228,10 @@ func TestDriver_Get_Diff(t *testing.T) {
 
 	// Mock EROFS mounts
 	mockMounter.On("Mount", mock.Anything, mock.Anything, "erofs", mock.Anything).Return(nil)
-	
+
 	// Mock overlay mounts
 	mockMounter.On("Mount", "overlay", mock.Anything, "overlay", mock.Anything).Return(nil)
-	
+
 	// Mock cleanup calls
 	mockMounter.On("LazyUnmount", mock.Anything).Return(nil)
 	mockMounter.On("Unmount", mock.Anything).Return(nil)
@@ -241,7 +241,7 @@ func TestDriver_Get_Diff(t *testing.T) {
 	arch, err := d.Diff("L2", nil, "L1", nil, "")
 	assert.NoError(t, err)
 	assert.NotNil(t, arch)
-	
+
 	// Close the archive
 	arch.Close()
 }
@@ -354,10 +354,10 @@ func TestDriver_Get_DockerfileScenario(t *testing.T) {
 
 	// Mock EROFS mounts
 	mockMounter.On("Mount", mock.Anything, mock.Anything, "erofs", mock.Anything).Return(nil)
-	
+
 	// Mock overlay mounts
 	mockMounter.On("Mount", "overlay", mock.Anything, "overlay", mock.Anything).Return(nil)
-	
+
 	// Mock cleanup calls
 	mockMounter.On("LazyUnmount", mock.Anything).Return(nil)
 
@@ -371,7 +371,7 @@ func TestDriver_Get_DockerfileScenario(t *testing.T) {
 	mergedDir, err := d.Get(layer3, graphdriver.MountOpts{})
 	assert.NoError(t, err)
 	assert.Contains(t, mergedDir, "merged")
-	
+
 	// Verify overlay mount was called
 	mockMounter.AssertCalled(t, "Mount", "overlay", mock.Anything, "overlay", mock.Anything)
 }

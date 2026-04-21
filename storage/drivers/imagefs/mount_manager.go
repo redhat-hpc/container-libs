@@ -82,8 +82,8 @@ func (m *MountManager) MountLayerWithDevices(containerID, layerID, imagePath str
 			return layerDir, nil
 		}
 
-		// If the kernel mount failed due to permissions (EPERM), 
-		// we might be in a user namespace where we are "root" but not 
+		// If the kernel mount failed due to permissions (EPERM),
+		// we might be in a user namespace where we are "root" but not
 		// privileged enough to use syscall.Mount. Fall back to FUSE.
 		if strings.Contains(err.Error(), "operation not permitted") {
 			logrus.Debugf("[imagefs] Kernel mount failed with EPERM, falling back to FUSE for layer %s", layerID)
@@ -106,7 +106,7 @@ func (m *MountManager) mountRoot(source, target string) error {
 		fsType = "squashfs"
 	}
 
-	// Use secure mount flags via options string. 
+	// Use secure mount flags via options string.
 	// Removed noexec to allow container binaries to run.
 	options := "nodev,nosuid"
 	logrus.Debugf("[imagefs] Root mounting layer: %s -> %s (type: %s, opts: %s)", source, target, fsType, options)
@@ -160,7 +160,7 @@ func (m *MountManager) UnmountLayer(target string) error {
 
 func (m *MountManager) CleanupRundir(containerID string) error {
 	rundir := m.GetRundir(containerID)
-	
+
 	entries, err := os.ReadDir(rundir)
 	if err != nil {
 		if os.IsNotExist(err) {

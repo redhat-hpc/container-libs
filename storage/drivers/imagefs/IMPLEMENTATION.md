@@ -89,16 +89,25 @@ For EROFS-only layer stacks on kernel 5.14+:
 
 ### Exporting Layers (`Diff`)
 
-To ensure correct digests when pushing images:
+The driver implements optimized diff logic based on layer type:
 
 ```go
 func (d *Driver) Diff(id, parent string) (io.ReadCloser, error) {
-    if parent == "" && originalTarballExists {
-        // Return the original tarball directly
-        // This ensures tar-split reconstruction produces the correct digest
+    // For committed image layers with no parent:
+    // Return the original tarball to preserve digests
+    if parent == "" && isCommittedLayer {
         return os.Open(imagePath + ".tar")
     }
-    // Fall back to naive diff for incremental exports
+    
+    // For working container layers (no layer.erofs):
+    // Tar the upperdir directly to avoid device/inode mismatches
+    if !isCommittedLayer {
+        return archive.TarWithOptions(upperdir, &archive.TarOptions{
+            WhiteoutFormat: archive.OverlayWhiteoutFormat,
+        })
+    }
+    
+    // For committed layers with parents: use naive diff
     return d.naiveDiff.Diff(...)
 }
 ```
@@ -138,6 +147,43 @@ Result: Only `b.txt` exists in the final container.
 
 This ensures the exact original tar structure is preserved for digest verification.
 
+### Bloated Diff Tarballs for Working Layers
+
+**Problem**: When building images with multiple RUN steps, intermediate layers became hundreds of megabytes instead of a few kilobytes, causing image sizes to balloon (e.g., a simple busybox-based image showing 422 MB instead of 5 MB).
+
+**Root Cause**: 
+1. Working container layers (during `RUN` steps) don't have a `layer.erofs` yet - changes are only in the overlay upperdir
+2. When computing diffs via `naiveDiff.Diff()`, the driver called `Get()` for both the working layer and its parent
+3. Both `Get()` calls created overlay mounts, causing same files to appear with different device/inode numbers
+4. `ChangesDirs()` inode-based optimization marked ALL files as "changed" (not just the actual modifications)
+5. `ExportChanges()` included full file contents for all "changed" files
+6. Result: 398 MB tarball containing duplicate busybox binaries instead of a 3 KB tarball with just the whiteout file
+
+**Solution**: 
+Implement custom `Diff()` logic for working container layers that tars the `upperdir` directly instead of using `naiveDiff`:
+
+```go
+if !isCommittedLayer {
+    upperdir := filepath.Join(d.dir(id), "upper")
+    return archive.TarWithOptions(upperdir, &archive.TarOptions{
+        WhiteoutFormat: archive.OverlayWhiteoutFormat,
+    })
+}
+```
+
+**How it works:**
+- The overlay `upperdir` contains only the actual changes made in that layer
+- `TarWithOptions` with `OverlayWhiteoutFormat` converts whiteout character devices (created by `rm`) to `.wh.*` files
+- When `ApplyDiff` processes the tarball, `mkfs.erofs --aufs` converts `.wh.*` files back to character devices
+- No overlay mounts are created during diff, avoiding device/inode mismatches
+- Only actual changes are included in the tarball
+
+**Result:**
+- Layer from `RUN touch /root/a.txt`: ~3 KB tarball
+- Layer from `RUN rm /root/a.txt`: ~3 KB tarball (just the whiteout)
+- Layer from `RUN touch /root/b.txt`: ~3 KB tarball
+- Total image size: ~5-6 MB (not 422 MB)
+
 ### Committed vs Working Layers
 
 The driver distinguishes between two layer types:
@@ -147,14 +193,16 @@ The driver distinguishes between two layer types:
 - Content visible via EROFS mount
 - Whiteouts stored as character devices
 - Original tarball preserved for export
+- `Diff()` returns original tarball (for base layers) or uses naiveDiff (for derived layers)
 
 **Working Container Layers** (no `layer.erofs`):
 - No EROFS image yet
 - Changes captured in overlay upperdir
-- Created during container builds
-- Converted to EROFS when committed
+- Created during container builds (e.g., during `RUN` steps)
+- Converted to EROFS when committed via `ApplyDiff()`
+- `Diff()` tars the upperdir directly with whiteout format conversion
 
-The `Get()` method checks for `layer.erofs` existence to determine layer type and mount accordingly.
+The `Get()` method checks for `layer.erofs` existence to determine layer type and mount accordingly. The `Diff()` method uses this same check to determine the optimal diff strategy.
 
 ### User Namespace Support (`CreateFromTemplate`)
 
@@ -184,6 +232,22 @@ func (d *Driver) CreateFromTemplate(id, template string, ...) error {
 2. **Read-Write Template Layers**: Creates normal layer with upperdir for modifications
 
 This approach leverages EROFS immutability - since the image content never changes and ID mapping happens at the kernel level during mount, we can safely share EROFS images across user namespaces via symlinks.
+
+### Synchronization Mode (`SyncMode`)
+
+The driver supports filesystem synchronization configuration via the `SyncMode()` method:
+
+```go
+func (d *Driver) SyncMode() graphdriver.SyncMode {
+    return d.syncMode  // Defaults to SyncModeNone
+}
+```
+
+**Sync Modes:**
+- **SyncModeNone** (default): No explicit synchronization, relies on OS buffering
+- **SyncModeFilesystem**: Uses `syncfs()` before marking layers as present
+
+For imagefs, `SyncModeNone` is appropriate because EROFS images are immutable once created, and the mkfs.erofs tool handles proper data integrity during image creation.
 
 ## Mount Manager
 

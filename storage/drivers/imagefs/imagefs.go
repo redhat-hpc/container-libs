@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/sirupsen/logrus"
@@ -23,10 +24,10 @@ import (
 const parentFileName = "parent"
 
 type Driver struct {
-	home     string
-	runRoot  string
-	options  Options
-	mm       *MountManager
+	home      string
+	runRoot   string
+	options   Options
+	mm        *MountManager
 	naiveDiff graphdriver.DiffDriver
 }
 
@@ -37,10 +38,10 @@ func Init(home string, options graphdriver.Options) (graphdriver.Driver, error) 
 	}
 
 	d := &Driver{
-		home:     home,
-		runRoot:  options.RunRoot,
-		options:  *opts,
-		mm:       NewMountManager(options.RunRoot, nil),
+		home:    home,
+		runRoot: options.RunRoot,
+		options: *opts,
+		mm:      NewMountManager(options.RunRoot, nil),
 	}
 	d.naiveDiff = graphdriver.NewNaiveDiffDriver(d, graphdriver.NewNaiveLayerIDMapUpdater(d))
 	return d, nil
@@ -120,12 +121,6 @@ func (d *Driver) Get(id string, options graphdriver.MountOpts) (string, error) {
 		}
 	}()
 
-	// Separate the requested layer (id) from its parent layers.
-	// The parent layers (everything below id) are always mounted as EROFS lowerdirs.
-	if len(layers) > 0 {
-		layers = layers[:len(layers)-1]
-	}
-
 	// Check if the requested layer itself has a committed image (data.img).
 	// If it does, it's a committed image layer and its own EROFS image must be
 	// included as the topmost lowerdir so that its content is visible in the
@@ -133,6 +128,33 @@ func (d *Driver) Get(id string, options graphdriver.MountOpts) (string, error) {
 	// layer whose writes are captured by the overlay upperdir.
 	idImagePath := d.getImagePath(id)
 	isCommittedLayer := idImagePath != ""
+
+	// If this is a read-only mount request for a committed layer, just mount
+	// the layer directly without overlay. This is important for tar-split
+	// reconstruction which needs to read the exact original layer content.
+	isReadOnly := slices.Contains(options.Options, "ro")
+	if isReadOnly && isCommittedLayer {
+		var devicePaths []string
+		if filepath.Ext(idImagePath) == ".img" {
+			devicePath := idImagePath + ".tar"
+			if fileutils.Exists(devicePath) == nil {
+				devicePaths = append(devicePaths, devicePath)
+			}
+		}
+		isRoot := os.Getuid() == 0
+		mountPoint, err := d.mm.MountLayerWithDevices(containerID, id, idImagePath, isRoot, devicePaths)
+		if err != nil {
+			return "", fmt.Errorf("failed to mount layer %s read-only: %w", id, err)
+		}
+		success = true
+		return mountPoint, nil
+	}
+
+	// Separate the requested layer (id) from its parent layers.
+	// The parent layers (everything below id) are always mounted as EROFS lowerdirs.
+	if len(layers) > 0 {
+		layers = layers[:len(layers)-1]
+	}
 
 	// Mount parent layers as EROFS lowerdirs.
 	if len(layers) > 0 {
@@ -250,7 +272,11 @@ func (d *Driver) mountLayersSeparately(containerID string, layers []string) ([]s
 		// For EROFS layers, we also need the .tar device file
 		var devicePaths []string
 		if filepath.Ext(imagePath) == ".img" {
-			devicePath := imagePath + ".tar"
+			// Try .erofs.tar first (new format), fall back to .tar (backward compatibility)
+			devicePath := imagePath + ".erofs.tar"
+			if fileutils.Exists(devicePath) != nil {
+				devicePath = imagePath + ".tar"
+			}
 			if fileutils.Exists(devicePath) == nil {
 				devicePaths = append(devicePaths, devicePath)
 			}
@@ -305,10 +331,12 @@ func (d *Driver) mountErofsMerged(containerID string, layers []string) ([]string
 }
 
 func (d *Driver) Put(id string) error {
-	// Unmount merged dir
+	// Unmount merged dir (only if it exists - read-only mounts don't create it)
 	mergedDir := filepath.Join(d.dir(id), "merged")
-	if err := d.mm.mounter.Unmount(mergedDir); err != nil && !os.IsNotExist(err) {
-		logrus.Errorf("failed to unmount merged dir %s: %v", mergedDir, err)
+	if fileutils.Exists(mergedDir) == nil {
+		if err := d.mm.mounter.Unmount(mergedDir); err != nil {
+			logrus.Errorf("failed to unmount merged dir %s: %v", mergedDir, err)
+		}
 	}
 
 	// Unmount layers and cleanup rundir
@@ -443,6 +471,26 @@ func (d *Driver) Dedup(args graphdriver.DedupArgs) (graphdriver.DedupResult, err
 // --- DiffDriver implementation ---
 
 func (d *Driver) Diff(id string, idMappings *idtools.IDMappings, parent string, parentIDMappings *idtools.IDMappings, mountLabel string) (io.ReadCloser, error) {
+	// For committed image layers, we have the original tarball stored as data.img.tar.
+	// When exporting a layer with no parent (i.e., the full layer content), we should
+	// return the original tarball instead of mounting the EROFS image and re-tarballing,
+	// because the re-tarball process can produce different content/digests.
+	if parent == "" {
+		imagePath := d.getImagePath(id)
+		if imagePath != "" && filepath.Ext(imagePath) == ".img" {
+			tarballPath := imagePath + ".tar"
+			if fileutils.Exists(tarballPath) == nil {
+				logrus.Debugf("[imagefs] Returning original tarball for layer %s: %s", id, tarballPath)
+				f, err := os.Open(tarballPath)
+				if err != nil {
+					return nil, fmt.Errorf("failed to open tarball %s: %w", tarballPath, err)
+				}
+				return f, nil
+			}
+		}
+	}
+
+	// For layers with parents or layers without a tarball, fall back to naive diff
 	return d.naiveDiff.Diff(id, idMappings, parent, parentIDMappings, mountLabel)
 }
 
@@ -451,50 +499,20 @@ func (d *Driver) Changes(id string, idMappings *idtools.IDMappings, parent strin
 }
 
 func (d *Driver) ApplyDiff(id string, options graphdriver.ApplyDiffOpts) (int64, error) {
-	// To properly handle file deletions in EROFS images, we need to extract
-	// the diff tarball to a temporary directory first. This ensures that 
-	// deletion operations (represented as whiteout files in the tar) are
-	// properly preserved in the final EROFS image.
 	layerDir := d.dir(id)
-	tempDir, err := os.MkdirTemp(layerDir, "diff-")
-	if err != nil {
-		return 0, err
-	}
-	defer os.RemoveAll(tempDir)
-
-	// Extract the diff tarball to temp directory to properly handle deletions
-	// This ensures that whiteout files (representing deletions) are correctly 
-	// processed and that deleted files don't appear in the final EROFS image
-	tarOptions := &archive.TarOptions{
-		// Use overlay whiteout format to ensure proper deletion handling
-		WhiteoutFormat: archive.OverlayWhiteoutFormat,
-	}
-	
-	// Set ID mappings if provided
-	if options.Mappings != nil {
-		tarOptions.UIDMaps = options.Mappings.UIDs()
-		tarOptions.GIDMaps = options.Mappings.GIDs()
-	}
-	
-	if err := archive.Untar(options.Diff, tempDir, tarOptions); err != nil {
-		return 0, err
-	}
-
-	// Create image file from the properly extracted directory structure
-	// This preserves the correct filesystem state including deletions
 	imagePath := filepath.Join(layerDir, "data.img")
-	
-	// Create a tar from the directory and pass it to mkfs.erofs for image creation
-	// This preserves the directory structure with deletions properly represented
-	archive, err := archive.TarWithOptions(tempDir, &archive.TarOptions{
-		Compression: archive.Uncompressed,
-	})
-	if err != nil {
-		return 0, err
+	tarballPath := imagePath + ".tar"
+
+	// Save the original tarball - this is what tar-split will use
+	// to reconstruct the exact original tar when pushing the image
+	if err := writeToFile(options.Diff, tarballPath); err != nil {
+		return 0, fmt.Errorf("failed to save original tarball %s: %w", tarballPath, err)
 	}
-	defer archive.Close()
-	
-	if err := d.runMkfsErofs(archive, imagePath); err != nil {
+
+	// Create EROFS image directly from the tarball.
+	// The --aufs flag tells mkfs.erofs to automatically convert .wh.* files
+	// to overlayfs whiteout character devices (c 0 0) so deletions work correctly.
+	if err := d.runMkfsErofs(tarballPath, imagePath); err != nil {
 		return 0, fmt.Errorf("failed to create image file %s: %w", imagePath, err)
 	}
 
@@ -507,22 +525,19 @@ func (d *Driver) ApplyDiff(id string, options graphdriver.ApplyDiffOpts) (int64,
 	return info.Size(), nil
 }
 
-func (d *Driver) runMkfsErofs(r io.Reader, dest string) error {
-	// Write the tar stream to a file so mkfs.erofs can use it as both the
-	// filesystem source (--tar=i) and the backing data device (.tar file).
-	tarball := dest + ".tar"
-	if err := writeToFile(r, tarball); err != nil {
-		return fmt.Errorf("failed to write tarball %s: %w", tarball, err)
-	}
-
-	cmd := exec.Command("mkfs.erofs", "--tar=i", "-E", "legacy-compress", dest, tarball)
+func (d *Driver) runMkfsErofs(tarballPath, dest string) error {
+	// Create EROFS image from tarball with --aufs flag.
+	// The --aufs flag tells mkfs.erofs to convert .wh.* files to overlayfs
+	// whiteout character devices automatically during EROFS creation.
+	cmd := exec.Command("mkfs.erofs", "--tar=i", "--aufs", "-E", "legacy-compress", dest, tarballPath)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 
-	logrus.Debugf("[imagefs] Creating the layer: %v", cmd.Args)
+	logrus.Debugf("[imagefs] Creating EROFS with aufs whiteout conversion: %v", cmd.Args)
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("mkfs.erofs failed: %w: %s", err, stderr.String())
 	}
+
 	return nil
 }
 

@@ -60,8 +60,8 @@ func TestDriver_Get(t *testing.T) {
 			if i < len(layers)-1 {
 				os.WriteFile(filepath.Join(dir, "parent"), []byte(layers[i+1]), 0644)
 			}
-			os.WriteFile(filepath.Join(dir, "data.img"), []byte("dummy"), 0644)
-			os.WriteFile(filepath.Join(dir, "data.img.tar"), []byte("dummy-tar"), 0644)
+			os.WriteFile(filepath.Join(dir, "layer.erofs"), []byte("dummy"), 0644)
+			os.WriteFile(filepath.Join(dir, "layer.erofs.tar"), []byte("dummy-tar"), 0644)
 		}
 
 		// Mock all RunCommand calls including mkfs.erofs
@@ -92,16 +92,16 @@ func TestDriver_Get(t *testing.T) {
 			},
 		}
 
-		// Setup layers: L1 (.img) -> L2 (.sqsh) -> L3 (.img)
+		// Setup layers: L1 (.erofs) -> L2 (.sqsh) -> L3 (.erofs)
 		layers := []string{"L1", "L2", "L3"}
-		exts := []string{".img", ".sqsh", ".img"}
+		exts := []string{".erofs", ".sqsh", ".erofs"}
 		for i, l := range layers {
 			dir := filepath.Join(tmpDir, l)
 			os.MkdirAll(dir, 0755)
 			if i < len(layers)-1 {
 				os.WriteFile(filepath.Join(dir, "parent"), []byte(layers[i+1]), 0644)
 			}
-			os.WriteFile(filepath.Join(dir, "data"+exts[i]), []byte("dummy"), 0644)
+			os.WriteFile(filepath.Join(dir, "layer"+exts[i]), []byte("dummy"), 0644)
 		}
 
 		// Mock FUSE mounts for separate layers
@@ -165,8 +165,8 @@ func TestDriver_Get_EmptyLayers(t *testing.T) {
 	dir := filepath.Join(tmpDir, layerID)
 	os.MkdirAll(dir, 0755)
 	// No parent file - this is the base layer
-	os.WriteFile(filepath.Join(dir, "data.img"), []byte("dummy"), 0644)
-	os.WriteFile(filepath.Join(dir, "data.img.tar"), []byte("dummy-tar"), 0644)
+	os.WriteFile(filepath.Join(dir, "layer.erofs"), []byte("dummy"), 0644)
+	os.WriteFile(filepath.Join(dir, "layer.erofs.tar"), []byte("dummy-tar"), 0644)
 
 	// Mock all RunCommand calls
 	mockMounter.On("RunCommand", mock.Anything, mock.Anything).Return(nil)
@@ -219,8 +219,8 @@ func TestDriver_Get_Diff(t *testing.T) {
 		if i < len(layers)-1 {
 			os.WriteFile(filepath.Join(dir, "parent"), []byte(layers[i+1]), 0644)
 		}
-		os.WriteFile(filepath.Join(dir, "data.img"), []byte("dummy"), 0644)
-		os.WriteFile(filepath.Join(dir, "data.img.tar"), []byte("dummy-tar"), 0644)
+		os.WriteFile(filepath.Join(dir, "layer.erofs"), []byte("dummy"), 0644)
+		os.WriteFile(filepath.Join(dir, "layer.erofs.tar"), []byte("dummy-tar"), 0644)
 	}
 
 	// Mock all RunCommand calls
@@ -247,7 +247,7 @@ func TestDriver_Get_Diff(t *testing.T) {
 }
 
 func TestDriver_Get_WorkingContainerLayer(t *testing.T) {
-	// Tests that a working container layer (no data.img) uses the overlay
+	// Tests that a working container layer (no layer.erofs) uses the overlay
 	// upperdir for writes, while still seeing committed parent layers.
 	// This is the case during a RUN step in podman build.
 	tmpDir := t.TempDir()
@@ -263,18 +263,18 @@ func TestDriver_Get_WorkingContainerLayer(t *testing.T) {
 		},
 	}
 
-	// Setup: base layer (committed, has data.img) and a container layer (no data.img)
+	// Setup: base layer (committed, has layer.erofs) and a container layer (no layer.erofs)
 	baseLayer := "base"
 	baseDir := filepath.Join(tmpDir, baseLayer)
 	os.MkdirAll(baseDir, 0755)
-	os.WriteFile(filepath.Join(baseDir, "data.img"), []byte("busybox"), 0644)
-	os.WriteFile(filepath.Join(baseDir, "data.img.tar"), []byte("busybox-tar"), 0644)
+	os.WriteFile(filepath.Join(baseDir, "layer.erofs"), []byte("busybox"), 0644)
+	os.WriteFile(filepath.Join(baseDir, "layer.erofs.tar"), []byte("busybox-tar"), 0644)
 
 	containerLayer := "container1"
 	containerDir := filepath.Join(tmpDir, containerLayer)
 	os.MkdirAll(containerDir, 0755)
 	os.WriteFile(filepath.Join(containerDir, "parent"), []byte(baseLayer), 0644)
-	// NO data.img — this is a working container layer
+	// NO layer.erofs — this is a working container layer
 
 	mockMounter.On("RunCommand", mock.Anything, mock.Anything).Return(nil)
 	mockMounter.On("Mount", mock.Anything, mock.Anything, "erofs", mock.Anything).Return(nil)
@@ -286,7 +286,7 @@ func TestDriver_Get_WorkingContainerLayer(t *testing.T) {
 	assert.Contains(t, mergedDir, "merged")
 
 	// Verify that the overlay mount was called.
-	// The container layer should NOT have its own EROFS mount (no data.img),
+	// The container layer should NOT have its own EROFS mount (no layer.erofs),
 	// so only the base layer's EROFS is a lowerdir, and container1/upper is the upperdir.
 	overlayCall := mockMounter.Calls[len(mockMounter.Calls)-1]
 	assert.Equal(t, "Mount", overlayCall.Method)
@@ -321,33 +321,33 @@ func TestDriver_Get_DockerfileScenario(t *testing.T) {
 	baseLayer := "base"
 	baseDir := filepath.Join(tmpDir, baseLayer)
 	os.MkdirAll(baseDir, 0755)
-	// getImagePath looks for data.img or data.sqsh
-	os.WriteFile(filepath.Join(baseDir, "data.img"), []byte("busybox-dummy"), 0644)
-	os.WriteFile(filepath.Join(baseDir, "data.img.tar"), []byte("busybox-tar"), 0644)
+	// getImagePath looks for layer.erofs or layer.sqsh
+	os.WriteFile(filepath.Join(baseDir, "layer.erofs"), []byte("busybox-dummy"), 0644)
+	os.WriteFile(filepath.Join(baseDir, "layer.erofs.tar"), []byte("busybox-tar"), 0644)
 
 	// Layer 2: after first RUN
 	layer1 := "layer1"
 	layer1Dir := filepath.Join(tmpDir, layer1)
 	os.MkdirAll(layer1Dir, 0755)
 	os.WriteFile(filepath.Join(layer1Dir, "parent"), []byte(baseLayer), 0644)
-	os.WriteFile(filepath.Join(layer1Dir, "data.img"), []byte("layer1-dummy"), 0644)
-	os.WriteFile(filepath.Join(layer1Dir, "data.img.tar"), []byte("layer1-tar"), 0644)
+	os.WriteFile(filepath.Join(layer1Dir, "layer.erofs"), []byte("layer1-dummy"), 0644)
+	os.WriteFile(filepath.Join(layer1Dir, "layer.erofs.tar"), []byte("layer1-tar"), 0644)
 
 	// Layer 3: after second RUN
 	layer2 := "layer2"
 	layer2Dir := filepath.Join(tmpDir, layer2)
 	os.MkdirAll(layer2Dir, 0755)
 	os.WriteFile(filepath.Join(layer2Dir, "parent"), []byte(layer1), 0644)
-	os.WriteFile(filepath.Join(layer2Dir, "data.img"), []byte("layer2-dummy"), 0644)
-	os.WriteFile(filepath.Join(layer2Dir, "data.img.tar"), []byte("layer2-tar"), 0644)
+	os.WriteFile(filepath.Join(layer2Dir, "layer.erofs"), []byte("layer2-dummy"), 0644)
+	os.WriteFile(filepath.Join(layer2Dir, "layer.erofs.tar"), []byte("layer2-tar"), 0644)
 
 	// Layer 4: after third RUN (the final layer we want to mount)
 	layer3 := "layer3"
 	layer3Dir := filepath.Join(tmpDir, layer3)
 	os.MkdirAll(layer3Dir, 0755)
 	os.WriteFile(filepath.Join(layer3Dir, "parent"), []byte(layer2), 0644)
-	os.WriteFile(filepath.Join(layer3Dir, "data.img"), []byte("layer3-dummy"), 0644)
-	os.WriteFile(filepath.Join(layer3Dir, "data.img.tar"), []byte("layer3-tar"), 0644)
+	os.WriteFile(filepath.Join(layer3Dir, "layer.erofs"), []byte("layer3-dummy"), 0644)
+	os.WriteFile(filepath.Join(layer3Dir, "layer.erofs.tar"), []byte("layer3-tar"), 0644)
 
 	// Mock all RunCommand calls
 	mockMounter.On("RunCommand", mock.Anything, mock.Anything).Return(nil)

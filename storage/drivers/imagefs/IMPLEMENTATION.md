@@ -23,14 +23,16 @@ storage/imagefs/<layer_id>/
 The driver creates container filesystems through a multi-stage mounting process:
 
 1. **Layer Resolution**: Traverse the image hierarchy to identify all required layers
-2. **Base Mounts**: Mount each immutable EROFS image into a volatile directory (`/run/user/<uid>/containers/imagefs/...`)
+2. **Base Mounts** (`mount_manager.go`): Mount each immutable EROFS image into a volatile directory (`/run/user/<uid>/containers/imagefs/...`)
    - **Privileged Mode**: Uses kernel mounts (`mount -t erofs`)
    - **Rootless Mode**: Falls back to FUSE (`erofsfuse`) when kernel mount fails with EPERM
    - **Security**: All mounts use `nodev` and `nosuid` flags
-3. **Overlay Composition**: Create an OverlayFS mount with:
+   - **Device Handling**: Passes `.tar` device files to `erofsfuse` for whiteout/metadata access
+3. **Overlay Composition** (`mount.go`): Create a robust OverlayFS mount with:
    - `lowerdir`: Sequence of mounted EROFS image layers (topmost first)
    - `upperdir`: Local directory for container writes
    - `workdir`: OverlayFS internal operations directory
+   - **Robust Mounting**: Uses reexec subprocess with `/proc/self/fd` for deep layer stacks
 
 ### EROFS Features
 
@@ -249,13 +251,118 @@ func (d *Driver) SyncMode() graphdriver.SyncMode {
 
 For imagefs, `SyncModeNone` is appropriate because EROFS images are immutable once created, and the mkfs.erofs tool handles proper data integrity during image creation.
 
-## Mount Manager
+### Robust Overlay Mounting
 
-The `MountManager` abstracts mounting complexity:
-- Handles both kernel and FUSE mounts
-- Automatic fallback from kernel → FUSE on EPERM
-- Manages volatile `rundir` lifecycle
-- Device path management for EROFS metadata
+**Problem**: Images with many layers (50+) can produce extremely long `lowerdir` mount option strings (e.g., `lowerdir=/run/.../layer1:/run/.../layer2:...:/run/.../layer50`). Linux has a page size limit (typically 4KB) for mount option strings, causing mount failures with deep layer stacks.
+
+**Solution**: The driver uses a sophisticated reexec-based mounting system (similar to the overlay driver) that handles long mount option strings gracefully.
+
+#### How it Works (`mount.go`)
+
+```go
+func mountOverlayFrom(dir, device, target, mType string, flags uintptr, label string) error {
+    // 1. Spawn reexec subprocess in clean environment
+    cmd := reexec.Command("imagefs-mountfrom", dir)
+    
+    // 2. Pass mount options via stdin pipe
+    json.NewEncoder(w).Encode(options)
+    
+    // 3. Subprocess handles the actual mount with page size optimization
+}
+
+func mountOverlayFromMain() {
+    runtime.LockOSThread()  // Thread safety for mount operations
+    
+    // If mount options fit in page size, mount directly
+    if len(options.Label) < pageSize {
+        unix.Mount(...)
+        return
+    }
+    
+    // Otherwise, use file descriptor trick to shorten paths:
+    // 1. Open file descriptors for each lowerdir path
+    // 2. Replace long paths with short /proc/self/fd/<N> references
+    // 3. Reconstruct mount options with shorter paths
+    // 4. Retry mount from /proc/self/fd working directory
+}
+```
+
+#### Benefits
+
+1. **Deep Layer Stack Support**: Handles images with 100+ layers without mount failures
+2. **Thread Safety**: `runtime.LockOSThread()` prevents race conditions during mount operations
+3. **Clean Process Context**: Reexec subprocess ensures mounting happens in isolated environment
+4. **Automatic Optimization**: Only uses `/proc/self/fd` trick when needed (page size exceeded)
+5. **Production Tested**: Based on the battle-tested overlay driver implementation
+
+#### File Descriptor Optimization Example
+
+Before optimization (exceeds page size):
+```
+lowerdir=/run/containers/imagefs/abc/layer1:/run/containers/imagefs/abc/layer2:...:/run/containers/imagefs/abc/layer50
+```
+
+After optimization (fits in page size):
+```
+lowerdir=3:4:5:...:52
+# Where each number is a file descriptor opened to the corresponding path
+# and the mount happens from /proc/self/fd/ as the working directory
+```
+
+## Mount Architecture
+
+The driver uses two complementary mounting systems:
+
+### MountManager (`mount_manager.go`)
+**Purpose**: Mount individual EROFS/squashfs layer images
+
+**Responsibilities**:
+- Mount single EROFS images using kernel (`mount -t erofs`) or FUSE (`erofsfuse`)
+- Handle privileged vs rootless mode with automatic fallback
+- Pass device paths (`.tar` files) to FUSE for whiteout/metadata access
+- Manage volatile `rundir` lifecycle (`/run/user/<uid>/containers/imagefs/...`)
+- Provide unmount and cleanup operations
+
+**Example**:
+```
+Input:  layer.erofs file at /storage/imagefs/abc123/layer.erofs
+Output: Mounted at /run/user/1000/containers/imagefs/container-id/abc123/
+```
+
+### Overlay Mount (`mount.go`)
+**Purpose**: Combine multiple mounted layers into a single overlay filesystem
+
+**Responsibilities**:
+- Create OverlayFS mount with multiple lowerdirs
+- Handle kernel page size limits for long mount option strings
+- Use reexec subprocess for clean mount environment
+- Optimize with `/proc/self/fd` file descriptors when needed
+
+**Example**:
+```
+Input:  lowerdir=layer1:layer2:layer3, upperdir=upper/, workdir=work/
+Output: Unified view at merged/ with all layers combined
+```
+
+### Workflow
+
+```
+1. Get() is called for container ID
+   ↓
+2. MountManager mounts each EROFS layer individually
+   mount_manager.go: abc123/layer.erofs → /run/.../abc123/
+   mount_manager.go: def456/layer.erofs → /run/.../def456/
+   mount_manager.go: ghi789/layer.erofs → /run/.../ghi789/
+   ↓
+3. mountOverlayFrom combines them into unified view
+   mount.go: overlay(lowerdir=/run/.../abc123:/run/.../def456:/run/.../ghi789,
+                    upperdir=upper/,
+                    workdir=work/) → merged/
+   ↓
+4. Return merged/ as container root filesystem
+```
+
+This separation provides clean architecture where each component handles its specific mounting complexity.
 
 ## Testing
 

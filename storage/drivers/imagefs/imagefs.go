@@ -1,3 +1,5 @@
+//go:build linux
+
 package imagefs
 
 import (
@@ -274,9 +276,13 @@ func (d *Driver) Get(id string, options graphdriver.MountOpts) (string, error) {
 	}
 
 	// Final Overlay Mount
+	// Use the robust mountOverlayFrom which handles long lowerdir strings
+	// by opening file descriptors and using /proc/self/fd paths when needed.
 	opts := fmt.Sprintf("lowerdir=%s,upperdir=%s,workdir=%s", lowerdirString, upperdir, workdir)
 	logrus.Debugf("[imagefs] Final Overlay Mount: target=%s, opts=%s", mergedDir, opts)
-	err = d.mm.mounter.Mount("overlay", mergedDir, "overlay", opts)
+
+	// Use mountOverlayFrom for robustness with long mount option strings
+	err = mountOverlayFrom(d.home, "overlay", mergedDir, "overlay", 0, opts)
 	if err != nil {
 		return "", fmt.Errorf("failed to mount overlay: %w", err)
 	}

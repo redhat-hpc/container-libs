@@ -187,7 +187,7 @@ func (d *Driver) Get(id string, options graphdriver.MountOpts) (string, error) {
 			}
 		}
 		isRoot := os.Getuid() == 0
-		mountPoint, err := d.mm.MountLayerWithDevices(containerID, id, idImagePath, isRoot, devicePaths)
+		mountPoint, err := d.mm.MountLayerWithDevices(containerID, id, idImagePath, isRoot, devicePaths, options.MountLabel)
 		if err != nil {
 			return "", fmt.Errorf("failed to mount layer %s read-only: %w", id, err)
 		}
@@ -211,10 +211,10 @@ func (d *Driver) Get(id string, options graphdriver.MountOpts) (string, error) {
 
 		if useMerged {
 			logrus.Debugf("[imagefs] Using merged EROFS strategy for container %s", containerID)
-			lowerDirs, err = d.mountErofsMerged(containerID, layers)
+			lowerDirs, err = d.mountErofsMerged(containerID, layers, options.MountLabel)
 		} else {
 			logrus.Debugf("[imagefs] Using separate layers strategy for container %s", containerID)
-			lowerDirs, err = d.mountLayersSeparately(containerID, layers)
+			lowerDirs, err = d.mountLayersSeparately(containerID, layers, options.MountLabel)
 		}
 
 		if err != nil {
@@ -245,7 +245,7 @@ func (d *Driver) Get(id string, options graphdriver.MountOpts) (string, error) {
 		}
 
 		isRoot := os.Getuid() == 0
-		mountPoint, err := d.mm.MountLayerWithDevices(containerID, id, idImagePath, isRoot, devicePaths)
+		mountPoint, err := d.mm.MountLayerWithDevices(containerID, id, idImagePath, isRoot, devicePaths, options.MountLabel)
 		if err != nil {
 			return "", fmt.Errorf("failed to mount layer %s: %w", id, err)
 		}
@@ -278,6 +278,8 @@ func (d *Driver) Get(id string, options graphdriver.MountOpts) (string, error) {
 	// Final Overlay Mount
 	// Use the robust mountOverlayFrom which handles long lowerdir strings
 	// by opening file descriptors and using /proc/self/fd paths when needed.
+	// Note: We pass options as a string, not flags, because mountOverlayFrom
+	// puts them in the Label field which gets parsed by ParseOptions.
 	opts := fmt.Sprintf("lowerdir=%s,upperdir=%s,workdir=%s", lowerdirString, upperdir, workdir)
 	logrus.Debugf("[imagefs] Final Overlay Mount: target=%s, opts=%s", mergedDir, opts)
 
@@ -310,7 +312,7 @@ func (d *Driver) canUseMergedErofs(layers []string) (bool, error) {
 	return true, nil
 }
 
-func (d *Driver) mountLayersSeparately(containerID string, layers []string) ([]string, error) {
+func (d *Driver) mountLayersSeparately(containerID string, layers []string, mountLabel string) ([]string, error) {
 	var lowerDirs []string
 	for _, layerID := range layers {
 		imagePath := d.getImagePath(layerID)
@@ -332,7 +334,7 @@ func (d *Driver) mountLayersSeparately(containerID string, layers []string) ([]s
 		}
 
 		isRoot := os.Getuid() == 0
-		mountPoint, err := d.mm.MountLayerWithDevices(containerID, layerID, imagePath, isRoot, devicePaths)
+		mountPoint, err := d.mm.MountLayerWithDevices(containerID, layerID, imagePath, isRoot, devicePaths, mountLabel)
 		if err != nil {
 			return nil, fmt.Errorf("failed to mount layer %s: %w", layerID, err)
 		}
@@ -341,7 +343,7 @@ func (d *Driver) mountLayersSeparately(containerID string, layers []string) ([]s
 	return lowerDirs, nil
 }
 
-func (d *Driver) mountErofsMerged(containerID string, layers []string) ([]string, error) {
+func (d *Driver) mountErofsMerged(containerID string, layers []string, mountLabel string) ([]string, error) {
 	var imagePaths []string
 	var devicePaths []string
 	for _, layerID := range layers {
@@ -375,7 +377,7 @@ func (d *Driver) mountErofsMerged(containerID string, layers []string) ([]string
 	// device paths so erofsfuse can access the device files (including whiteouts)
 	// that were stored separately in the .tar files
 	isRoot := os.Getuid() == 0
-	mountPoint, err := d.mm.MountLayerWithDevices(containerID, "merged-layers", mergedImagePath, isRoot, devicePaths)
+	mountPoint, err := d.mm.MountLayerWithDevices(containerID, "merged-layers", mergedImagePath, isRoot, devicePaths, mountLabel)
 	if err != nil {
 		return nil, fmt.Errorf("failed to mount merged EROFS image: %w", err)
 	}

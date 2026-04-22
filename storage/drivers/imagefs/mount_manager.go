@@ -1,15 +1,21 @@
+//go:build linux
+
 package imagefs
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 
 	"github.com/sirupsen/logrus"
+	"go.podman.io/storage/pkg/loopback"
 	"go.podman.io/storage/pkg/mount"
+	"golang.org/x/sys/unix"
 )
 
 type Mounter interface {
@@ -18,6 +24,12 @@ type Mounter interface {
 	LazyUnmount(target string) error
 	RunCommand(name string, args ...string) error
 }
+
+var (
+	// skipMountViaFile tracks whether direct file mounting is supported (kernel 6.12+).
+	// If false, we try direct file mounts first. If true, we skip directly to loopback device mounts.
+	skipMountViaFile atomic.Bool
+)
 
 type RealMounter struct{}
 
@@ -63,10 +75,10 @@ func (m *MountManager) GetRundir(containerID string) string {
 }
 
 func (m *MountManager) MountLayer(containerID, layerID, imagePath string, isRoot bool) (string, error) {
-	return m.MountLayerWithDevices(containerID, layerID, imagePath, isRoot, nil)
+	return m.MountLayerWithDevices(containerID, layerID, imagePath, isRoot, nil, "")
 }
 
-func (m *MountManager) MountLayerWithDevices(containerID, layerID, imagePath string, isRoot bool, devices []string) (string, error) {
+func (m *MountManager) MountLayerWithDevices(containerID, layerID, imagePath string, isRoot bool, devices []string, mountLabel string) (string, error) {
 	rundir := m.GetRundir(containerID)
 	layerDir := filepath.Join(rundir, layerID)
 
@@ -77,7 +89,7 @@ func (m *MountManager) MountLayerWithDevices(containerID, layerID, imagePath str
 	// Attempt to mount the layer.
 	// If we think we are root, try the kernel mount first.
 	if isRoot {
-		err := m.mountRoot(imagePath, layerDir)
+		err := m.mountRoot(imagePath, layerDir, devices, mountLabel)
 		if err == nil {
 			return layerDir, nil
 		}
@@ -85,8 +97,13 @@ func (m *MountManager) MountLayerWithDevices(containerID, layerID, imagePath str
 		// If the kernel mount failed due to permissions (EPERM),
 		// we might be in a user namespace where we are "root" but not
 		// privileged enough to use syscall.Mount. Fall back to FUSE.
+		//
+		// Also fall back to FUSE if the kernel requires a block device (ENOTBLK).
+		// On kernels < 6.12, EROFS/squashfs cannot be mounted directly from files.
 		if strings.Contains(err.Error(), "operation not permitted") {
 			logrus.Debugf("[imagefs] Kernel mount failed with EPERM, falling back to FUSE for layer %s", layerID)
+		} else if errors.Is(err, unix.ENOTBLK) || strings.Contains(err.Error(), "block device") {
+			logrus.Debugf("[imagefs] Kernel mount requires block device, falling back to FUSE for layer %s", layerID)
 		} else {
 			return "", err
 		}
@@ -100,20 +117,114 @@ func (m *MountManager) MountLayerWithDevices(containerID, layerID, imagePath str
 	return layerDir, nil
 }
 
-func (m *MountManager) mountRoot(source, target string) error {
+// openBlobFile mounts an EROFS or squashfs image file using the new mount API.
+// It supports both direct file mounting (kernel 6.12+) and loopback device mounting (kernel 5.14-6.11).
+// For metadata-only EROFS images, device paths can be provided for external data.
+// Returns a file descriptor for the mounted filesystem which must be closed by the caller.
+func openBlobFile(blobFile, fsType string, useLoopDevice bool, devices []string, mountLabel string) (int, error) {
+	var loop *os.File
+
+	if useLoopDevice {
+		var err error
+		loop, err = loopback.AttachLoopDeviceRO(blobFile)
+		if err != nil {
+			return -1, err
+		}
+		defer loop.Close()
+		blobFile = loop.Name()
+	}
+
+	// Use new mount API
+	fsfd, err := unix.Fsopen(fsType, 0)
+	if err != nil {
+		return -1, fmt.Errorf("failed to open %s filesystem: %w", fsType, err)
+	}
+	defer unix.Close(fsfd)
+
+	if err := unix.FsconfigSetString(fsfd, "source", blobFile); err != nil {
+		return -1, fmt.Errorf("failed to set source for %s: %w", fsType, err)
+	}
+
+	// For metadata-only EROFS images, set external device paths
+	if fsType == "erofs" && len(devices) > 0 {
+		for _, device := range devices {
+			if err := unix.FsconfigSetString(fsfd, "device", device); err != nil {
+				return -1, fmt.Errorf("failed to set device %s for erofs: %w", device, err)
+			}
+		}
+	}
+
+	// Apply SELinux context if provided
+	if mountLabel != "" {
+		if err := unix.FsconfigSetString(fsfd, "context", mountLabel); err != nil {
+			return -1, fmt.Errorf("failed to set SELinux context for %s: %w", fsType, err)
+		}
+	}
+
+	if err := unix.FsconfigSetFlag(fsfd, "ro"); err != nil {
+		return -1, fmt.Errorf("failed to set %s read-only: %w", fsType, err)
+	}
+
+	// Container images don't use ACLs - always set noacl for EROFS
+	if fsType == "erofs" {
+		if err := unix.FsconfigSetFlag(fsfd, "noacl"); err != nil {
+			return -1, fmt.Errorf("failed to set noacl for erofs: %w", err)
+		}
+	}
+
+	if err := unix.FsconfigCreate(fsfd); err != nil {
+		return -1, fmt.Errorf("failed to create %s filesystem: %w", fsType, err)
+	}
+
+	mfd, err := unix.Fsmount(fsfd, 0, unix.MOUNT_ATTR_RDONLY)
+	if err != nil {
+		return -1, fmt.Errorf("failed to mount %s filesystem: %w", fsType, err)
+	}
+
+	return mfd, nil
+}
+
+func (m *MountManager) mountRoot(source, target string, devices []string, mountLabel string) error {
+	// Detect filesystem type
 	fsType := "erofs"
 	if filepath.Ext(source) == ".sqsh" {
 		fsType = "squashfs"
 	}
 
-	// Use secure mount flags via options string.
-	// Removed noexec to allow container binaries to run.
-	options := "nodev,nosuid"
-	logrus.Debugf("[imagefs] Root mounting layer: %s -> %s (type: %s, opts: %s)", source, target, fsType, options)
-	err := m.mounter.Mount(source, target, fsType, options)
-	if err != nil {
-		return fmt.Errorf("mounter.Mount failed (%s): %w", fsType, err)
+	// Tier 1: Try direct file mount (kernel 6.12+)
+	if !skipMountViaFile.Load() {
+		mfd, err := openBlobFile(source, fsType, false, devices, mountLabel)
+		if err == nil {
+			defer unix.Close(mfd)
+			if err := unix.MoveMount(mfd, "", unix.AT_FDCWD, target, unix.MOVE_MOUNT_F_EMPTY_PATH); err != nil {
+				return fmt.Errorf("failed to move mount to %q: %w", target, err)
+			}
+			logrus.Debugf("[imagefs] Kernel mounted %s via direct file: %s -> %s (devices: %v, label: %s)", fsType, source, target, devices, mountLabel)
+			return nil
+		}
+
+		// If direct mount failed due to block device requirement, remember and fall through
+		if errors.Is(err, unix.ENOTBLK) {
+			logrus.Debugf("[imagefs] Direct file mounting not supported, using loopback device")
+			skipMountViaFile.Store(true)
+		} else {
+			// Real error - return it
+			return fmt.Errorf("kernel mount failed: %w", err)
+		}
 	}
+
+	// Tier 2: Try loopback device mount (kernel 5.14-6.11)
+	mfd, err := openBlobFile(source, fsType, true, devices, mountLabel)
+	if err != nil {
+		return fmt.Errorf("loopback mount failed: %w", err)
+	}
+	defer unix.Close(mfd)
+
+	if err := unix.MoveMount(mfd, "", unix.AT_FDCWD, target, unix.MOVE_MOUNT_F_EMPTY_PATH); err != nil {
+		return fmt.Errorf("failed to move mount to %q: %w", target, err)
+	}
+
+	logrus.Debugf("[imagefs] Kernel mounted %s via loopback: %s -> %s (devices: %v, label: %s)", fsType, source, target, devices, mountLabel)
 	return nil
 }
 

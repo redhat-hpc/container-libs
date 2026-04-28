@@ -3,7 +3,6 @@
 package imagefs
 
 import (
-	"archive/tar"
 	"bytes"
 	"fmt"
 	"io"
@@ -691,20 +690,17 @@ func (d *Driver) Diff(id string, idMappings *idtools.IDMappings, parent string, 
 	imagePath := d.getImagePath(id)
 	isCommittedLayer := imagePath != ""
 
-	// For committed image layers with no parent, return the original tarball.
-	// This ensures tar-split reconstruction produces the correct digest.
-	if parent == "" && isCommittedLayer {
-		ext := filepath.Ext(imagePath)
-		if ext == ".erofs" || ext == ".sqfs" {
-			tarballPath := imagePath + ".tar"
-			if fileutils.Exists(tarballPath) == nil {
-				logrus.Debugf("[imagefs] Returning original tarball for layer %s: %s", id, tarballPath)
-				f, err := os.Open(tarballPath)
-				if err != nil {
-					return nil, fmt.Errorf("failed to open tarball %s: %w", tarballPath, err)
-				}
-				return f, nil
+	// For EROFS committed layers with no parent, return the original tarball.
+	// For squashfs, use naiveDiff - the storage layer handles tar-split reconstruction.
+	if parent == "" && isCommittedLayer && filepath.Ext(imagePath) == ".erofs" {
+		tarballPath := imagePath + ".tar"
+		if fileutils.Exists(tarballPath) == nil {
+			logrus.Debugf("[imagefs] Returning original tarball for EROFS layer %s: %s", id, tarballPath)
+			f, err := os.Open(tarballPath)
+			if err != nil {
+				return nil, fmt.Errorf("failed to open tarball %s: %w", tarballPath, err)
 			}
+			return f, nil
 		}
 	}
 
@@ -738,46 +734,58 @@ func (d *Driver) Changes(id string, idMappings *idtools.IDMappings, parent strin
 func (d *Driver) ApplyDiff(id string, options graphdriver.ApplyDiffOpts) (int64, error) {
 	layerDir := d.dir(id)
 
-	var imagePath string
-	var tarballPath string
-
-	// Determine image path and tarball path based on format
 	if d.options.Format == FormatSquashFS {
-		imagePath = filepath.Join(layerDir, "layer.sqfs")
-		tarballPath = imagePath + ".tar"
-	} else {
-		imagePath = filepath.Join(layerDir, "layer.erofs")
-		tarballPath = imagePath + ".tar"
-	}
+		// SquashFS: Create image directly from stream, don't save tarball
+		// The storage layer handles tar-split separately in imagefs-layers/
+		imagePath := filepath.Join(layerDir, "layer.sqfs")
 
-	// Save the original tarball - this is what tar-split will use
-	// to reconstruct the exact original tar when pushing the image
-	if err := writeToFile(options.Diff, tarballPath); err != nil {
-		return 0, fmt.Errorf("failed to save original tarball %s: %w", tarballPath, err)
-	}
+		// Save to temporary file first (needed for sqfstar/tar2sqfs)
+		tmpDir := d.GetTempDirRootDirs()[0]
+		td, err := tempdir.NewTempDir(tmpDir)
+		if err != nil {
+			return 0, fmt.Errorf("failed to create temp dir: %w", err)
+		}
+		defer td.Cleanup()
 
-	// Create image file based on format
-	if d.options.Format == FormatSquashFS {
-		if err := d.runTar2Sqfs(tarballPath, imagePath); err != nil {
+		sa, err := td.StageAddition()
+		if err != nil {
+			return 0, fmt.Errorf("failed to stage temp file: %w", err)
+		}
+
+		tmpTarPath := sa.Path
+		size, err := writeToFile(options.Diff, tmpTarPath)
+		if err != nil {
+			return 0, fmt.Errorf("failed to write tar to temp file: %w", err)
+		}
+
+		// Create squashfs from temp tarball
+		if err := d.runTar2Sqfs(tmpTarPath, imagePath); err != nil {
 			return 0, fmt.Errorf("failed to create squashfs image %s: %w", imagePath, err)
 		}
+
+		logrus.Debugf("[imagefs] layer %s: squashfs created, size %d bytes", id, size)
+		return size, nil
 	} else {
+		// EROFS: Save original tarball (needed for --device= mounting)
+		imagePath := filepath.Join(layerDir, "layer.erofs")
+		tarballPath := imagePath + ".tar"
+
+		// Save the original tarball
+		size, err := writeToFile(options.Diff, tarballPath)
+		if err != nil {
+			return 0, fmt.Errorf("failed to save original tarball %s: %w", tarballPath, err)
+		}
+
 		// Create EROFS image directly from the tarball.
 		// The --aufs flag tells mkfs.erofs to automatically convert .wh.* files
 		// to overlayfs whiteout character devices (c 0 0) so deletions work correctly.
 		if err := d.runMkfsErofs(tarballPath, imagePath); err != nil {
 			return 0, fmt.Errorf("failed to create erofs image %s: %w", imagePath, err)
 		}
-	}
 
-	// Return the tarball size, not the image size
-	tarInfo, err := os.Stat(tarballPath)
-	if err != nil {
-		return 0, fmt.Errorf("failed to stat tarball: %w", err)
+		logrus.Debugf("[imagefs] layer %s: erofs created, tarball size %d bytes", id, size)
+		return size, nil
 	}
-
-	logrus.Debugf("[imagefs] layer %s: tarball size %d bytes, format %s", id, tarInfo.Size(), d.options.Format)
-	return tarInfo.Size(), nil
 }
 
 func (d *Driver) runMkfsErofs(tarballPath, dest string) error {
@@ -846,39 +854,18 @@ func (d *Driver) runTar2Sqfs(tarballPath, dest string) error {
 	return nil
 }
 
-func (d *Driver) convertWhiteoutsInTar(srcTar, dstTar string) error {
-	// Read the source tarball, convert .wh.* marker files to character devices,
-	// and write to the destination tarball.
-	// This is necessary because tar2sqfs doesn't have native whiteout support
-	// like mkfs.erofs --aufs does.
-
-	srcFile, err := os.Open(srcTar)
-	if err != nil {
-		return fmt.Errorf("failed to open source tar: %w", err)
-	}
-	defer srcFile.Close()
-
-	dstFile, err := os.Create(dstTar)
-	if err != nil {
-		return fmt.Errorf("failed to create dest tar: %w", err)
-	}
-	defer dstFile.Close()
-
-	return convertWhiteoutsTar(srcFile, dstFile)
-}
-
-func writeToFile(r io.Reader, dstPath string) error {
+func writeToFile(r io.Reader, dstPath string) (int64, error) {
 	// Create (or truncate) the destination file with appropriate permissions.
 	f, err := os.Create(dstPath)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	// Ensure the file is closed when we’re done.
 	defer f.Close()
 
-	// Copy the contents from the reader to the file.
-	_, err = io.Copy(f, r)
-	return err
+	// Copy the contents from the reader to the file and return size.
+	size, err := io.Copy(f, r)
+	return size, err
 }
 
 // func (d *Driver) runMkfsErofsWithExtraction(r io.Reader, dest string) error {
@@ -934,75 +921,4 @@ func (d *Driver) relabel(path string) {
 	// This is necessary for rootless containers to access files in the home directory.
 	// We ignore errors here because chcon might not be installed or SELinux might be disabled.
 	_ = exec.Command("chcon", "-t", "container_file_t", path).Run()
-}
-
-// convertWhiteoutsTar reads a tar archive and converts .wh.* whiteout marker files
-// to character device entries (c 0 0) that overlayfs recognizes as whiteouts.
-func convertWhiteoutsTar(src io.Reader, dst io.Writer) error {
-	tr := tar.NewReader(src)
-	tw := tar.NewWriter(dst)
-	defer tw.Close()
-
-	for {
-		hdr, err := tr.Next()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return fmt.Errorf("failed to read tar entry: %w", err)
-		}
-
-		// Check if this is a whiteout marker file (.wh.*)
-		baseName := filepath.Base(hdr.Name)
-		dirName := filepath.Dir(hdr.Name)
-
-		if targetName, isWhiteout := strings.CutPrefix(baseName, ".wh."); isWhiteout {
-			// This is a whiteout marker file
-			// Convert it to a character device entry for the target file
-
-			if baseName == ".wh..wh..opq" {
-				// Opaque whiteout - keeps the .wh..wh..opq marker file
-				// but we need to make it a character device
-				hdr.Typeflag = tar.TypeChar
-				hdr.Devmajor = 0
-				hdr.Devminor = 0
-				hdr.Size = 0
-				if err := tw.WriteHeader(hdr); err != nil {
-					return fmt.Errorf("failed to write opaque whiteout header: %w", err)
-				}
-			} else {
-				// Regular whiteout - create character device for the target file
-				targetPath := filepath.Join(dirName, targetName)
-
-				// Create a character device header for the whiteout
-				whiteoutHdr := &tar.Header{
-					Name:     targetPath,
-					Mode:     hdr.Mode,
-					Uid:      hdr.Uid,
-					Gid:      hdr.Gid,
-					Typeflag: tar.TypeChar,
-					Devmajor: 0,
-					Devminor: 0,
-					ModTime:  hdr.ModTime,
-				}
-
-				if err := tw.WriteHeader(whiteoutHdr); err != nil {
-					return fmt.Errorf("failed to write whiteout header for %s: %w", targetPath, err)
-				}
-			}
-		} else {
-			// Regular file - copy as-is
-			if err := tw.WriteHeader(hdr); err != nil {
-				return fmt.Errorf("failed to write header for %s: %w", hdr.Name, err)
-			}
-
-			if hdr.Size > 0 {
-				if _, err := io.Copy(tw, tr); err != nil {
-					return fmt.Errorf("failed to copy file content for %s: %w", hdr.Name, err)
-				}
-			}
-		}
-	}
-
-	return nil
 }

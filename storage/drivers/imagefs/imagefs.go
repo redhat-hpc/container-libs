@@ -268,9 +268,17 @@ func (d *Driver) Get(id string, options graphdriver.MountOpts) (string, error) {
 	if err := os.MkdirAll(upperdir, 0755); err != nil {
 		return "", err
 	}
+
+	// OverlayFS requires workdir to be empty. Clean it up if it exists.
+	if fileutils.Exists(workdir) == nil {
+		if err := os.RemoveAll(workdir); err != nil {
+			return "", fmt.Errorf("failed to clean workdir %s: %w", workdir, err)
+		}
+	}
 	if err := os.MkdirAll(workdir, 0755); err != nil {
 		return "", err
 	}
+
 	if err := os.MkdirAll(mergedDir, 0755); err != nil {
 		return "", err
 	}
@@ -288,6 +296,23 @@ func (d *Driver) Get(id string, options graphdriver.MountOpts) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("failed to mount overlay: %w", err)
 	}
+
+	// Verify the overlay mount has content
+	entries, err := os.ReadDir(mergedDir)
+	if err != nil {
+		return "", fmt.Errorf("failed to read merged dir %s: %w", mergedDir, err)
+	}
+	logrus.Debugf("[imagefs] Overlay mounted successfully: %s has %d entries", mergedDir, len(entries))
+	if len(entries) == 0 {
+		return "", fmt.Errorf("overlay mount succeeded but merged directory %s is empty", mergedDir)
+	}
+
+	// Verify the overlay is writable by creating a test file
+	testFile := filepath.Join(mergedDir, ".imagefs-write-test")
+	if err := os.WriteFile(testFile, []byte("test"), 0644); err != nil {
+		return "", fmt.Errorf("overlay mount is not writable in %s: %w", mergedDir, err)
+	}
+	os.Remove(testFile) // Clean up test file
 
 	success = true
 	return mergedDir, nil
@@ -323,11 +348,7 @@ func (d *Driver) mountLayersSeparately(containerID string, layers []string, moun
 		// For EROFS layers, we also need the .tar device file
 		var devicePaths []string
 		if filepath.Ext(imagePath) == ".erofs" {
-			// Try .erofs.tar first (new format), fall back to .tar (backward compatibility)
-			devicePath := imagePath + ".erofs.tar"
-			if fileutils.Exists(devicePath) != nil {
-				devicePath = imagePath + ".tar"
-			}
+			devicePath := imagePath + ".tar"
 			if fileutils.Exists(devicePath) == nil {
 				devicePaths = append(devicePaths, devicePath)
 			}

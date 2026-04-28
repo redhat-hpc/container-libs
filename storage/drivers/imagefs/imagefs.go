@@ -187,7 +187,7 @@ func (d *Driver) Get(id string, options graphdriver.MountOpts) (string, error) {
 			}
 		}
 		isRoot := os.Getuid() == 0
-		mountPoint, err := d.mm.MountLayerWithDevices(containerID, id, idImagePath, isRoot, devicePaths, options.MountLabel)
+		mountPoint, _, err := d.mm.MountLayerWithDevices(containerID, id, idImagePath, isRoot, devicePaths, options.MountLabel)
 		if err != nil {
 			return "", fmt.Errorf("failed to mount layer %s read-only: %w", id, err)
 		}
@@ -201,6 +201,9 @@ func (d *Driver) Get(id string, options graphdriver.MountOpts) (string, error) {
 		layers = layers[:len(layers)-1]
 	}
 
+	// Track whether any layer used FUSE mounts
+	var anyLayerUsedFuse bool
+
 	// Mount parent layers as EROFS lowerdirs.
 	if len(layers) > 0 {
 		// Determine strategy based on whether all layers are EROFS
@@ -209,16 +212,21 @@ func (d *Driver) Get(id string, options graphdriver.MountOpts) (string, error) {
 			return "", err
 		}
 
+		var layersUsedFuse bool
 		if useMerged {
 			logrus.Debugf("[imagefs] Using merged EROFS strategy for container %s", containerID)
-			lowerDirs, err = d.mountErofsMerged(containerID, layers, options.MountLabel)
+			lowerDirs, layersUsedFuse, err = d.mountErofsMerged(containerID, layers, options.MountLabel)
 		} else {
 			logrus.Debugf("[imagefs] Using separate layers strategy for container %s", containerID)
-			lowerDirs, err = d.mountLayersSeparately(containerID, layers, options.MountLabel)
+			lowerDirs, layersUsedFuse, err = d.mountLayersSeparately(containerID, layers, options.MountLabel)
 		}
 
 		if err != nil {
 			return "", err
+		}
+
+		if layersUsedFuse {
+			anyLayerUsedFuse = true
 		}
 
 		// Lowerdir for OverlayFS is top-to-bottom (most recent first)
@@ -245,9 +253,12 @@ func (d *Driver) Get(id string, options graphdriver.MountOpts) (string, error) {
 		}
 
 		isRoot := os.Getuid() == 0
-		mountPoint, err := d.mm.MountLayerWithDevices(containerID, id, idImagePath, isRoot, devicePaths, options.MountLabel)
+		mountPoint, layerUsedFuse, err := d.mm.MountLayerWithDevices(containerID, id, idImagePath, isRoot, devicePaths, options.MountLabel)
 		if err != nil {
 			return "", fmt.Errorf("failed to mount layer %s: %w", id, err)
+		}
+		if layerUsedFuse {
+			anyLayerUsedFuse = true
 		}
 		// Prepend: this layer's content sits on top of its parents.
 		lowerDirs = append([]string{mountPoint}, lowerDirs...)
@@ -284,35 +295,23 @@ func (d *Driver) Get(id string, options graphdriver.MountOpts) (string, error) {
 	}
 
 	// Final Overlay Mount
-	// Use the robust mountOverlayFrom which handles long lowerdir strings
-	// by opening file descriptors and using /proc/self/fd paths when needed.
-	// Note: We pass options as a string, not flags, because mountOverlayFrom
-	// puts them in the Label field which gets parsed by ParseOptions.
-	opts := fmt.Sprintf("lowerdir=%s,upperdir=%s,workdir=%s", lowerdirString, upperdir, workdir)
-	logrus.Debugf("[imagefs] Final Overlay Mount: target=%s, opts=%s", mergedDir, opts)
-
-	// Use mountOverlayFrom for robustness with long mount option strings
-	err = mountOverlayFrom(d.home, "overlay", mergedDir, "overlay", 0, opts)
+	// Use fuse-overlayfs when any layer is FUSE-mounted for better compatibility
+	if anyLayerUsedFuse {
+		// FUSE lowerdirs require fuse-overlayfs for proper xattr/copy-up support
+		if _, err := exec.LookPath("fuse-overlayfs"); err != nil {
+			return "", fmt.Errorf("fuse-overlayfs is required when layers are FUSE-mounted but not found in PATH")
+		}
+		logrus.Debugf("[imagefs] Using fuse-overlayfs for container %s (FUSE lowerdirs detected)", containerID)
+		err = mountFuseOverlay(lowerdirString, upperdir, workdir, mergedDir)
+	} else {
+		// All layers are kernel-mounted, use kernel overlayfs
+		opts := fmt.Sprintf("lowerdir=%s,upperdir=%s,workdir=%s", lowerdirString, upperdir, workdir)
+		logrus.Debugf("[imagefs] Using kernel overlayfs for container %s with options: %s", containerID, opts)
+		err = mountOverlayFrom(d.home, "overlay", mergedDir, "overlay", 0, opts)
+	}
 	if err != nil {
 		return "", fmt.Errorf("failed to mount overlay: %w", err)
 	}
-
-	// Verify the overlay mount has content
-	entries, err := os.ReadDir(mergedDir)
-	if err != nil {
-		return "", fmt.Errorf("failed to read merged dir %s: %w", mergedDir, err)
-	}
-	logrus.Debugf("[imagefs] Overlay mounted successfully: %s has %d entries", mergedDir, len(entries))
-	if len(entries) == 0 {
-		return "", fmt.Errorf("overlay mount succeeded but merged directory %s is empty", mergedDir)
-	}
-
-	// Verify the overlay is writable by creating a test file
-	testFile := filepath.Join(mergedDir, ".imagefs-write-test")
-	if err := os.WriteFile(testFile, []byte("test"), 0644); err != nil {
-		return "", fmt.Errorf("overlay mount is not writable in %s: %w", mergedDir, err)
-	}
-	os.Remove(testFile) // Clean up test file
 
 	success = true
 	return mergedDir, nil
@@ -337,12 +336,27 @@ func (d *Driver) canUseMergedErofs(layers []string) (bool, error) {
 	return true, nil
 }
 
-func (d *Driver) mountLayersSeparately(containerID string, layers []string, mountLabel string) ([]string, error) {
+// mountFuseOverlay mounts an overlay filesystem using fuse-overlayfs.
+func mountFuseOverlay(lowerdir, upperdir, workdir, target string) error {
+	opts := fmt.Sprintf("lowerdir=%s,upperdir=%s,workdir=%s", lowerdir, upperdir, workdir)
+	logrus.Debugf("[imagefs] Mounting overlay with fuse-overlayfs: target=%s, options=%s", target, opts)
+	cmd := exec.Command("fuse-overlayfs", "-o", opts, target)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("fuse-overlayfs failed: %w: %s", err, stderr.String())
+	}
+	logrus.Debugf("[imagefs] fuse-overlayfs mount successful: %s", target)
+	return nil
+}
+
+func (d *Driver) mountLayersSeparately(containerID string, layers []string, mountLabel string) ([]string, bool, error) {
 	var lowerDirs []string
+	var usedFuse bool
 	for _, layerID := range layers {
 		imagePath := d.getImagePath(layerID)
 		if imagePath == "" {
-			return nil, fmt.Errorf("no image file found for layer %s", layerID)
+			return nil, false, fmt.Errorf("no image file found for layer %s", layerID)
 		}
 
 		// For EROFS layers, we also need the .tar device file
@@ -355,29 +369,32 @@ func (d *Driver) mountLayersSeparately(containerID string, layers []string, moun
 		}
 
 		isRoot := os.Getuid() == 0
-		mountPoint, err := d.mm.MountLayerWithDevices(containerID, layerID, imagePath, isRoot, devicePaths, mountLabel)
+		mountPoint, layerUsedFuse, err := d.mm.MountLayerWithDevices(containerID, layerID, imagePath, isRoot, devicePaths, mountLabel)
 		if err != nil {
-			return nil, fmt.Errorf("failed to mount layer %s: %w", layerID, err)
+			return nil, false, fmt.Errorf("failed to mount layer %s: %w", layerID, err)
+		}
+		if layerUsedFuse {
+			usedFuse = true
 		}
 		lowerDirs = append(lowerDirs, mountPoint)
 	}
-	return lowerDirs, nil
+	return lowerDirs, usedFuse, nil
 }
 
-func (d *Driver) mountErofsMerged(containerID string, layers []string, mountLabel string) ([]string, error) {
+func (d *Driver) mountErofsMerged(containerID string, layers []string, mountLabel string) ([]string, bool, error) {
 	var imagePaths []string
 	var devicePaths []string
 	for _, layerID := range layers {
 		path := d.getImagePath(layerID)
 		if path == "" {
-			return nil, fmt.Errorf("no image file found for layer %s", layerID)
+			return nil, false, fmt.Errorf("no image file found for layer %s", layerID)
 		}
 		imagePaths = append(imagePaths, path)
 
 		// The device path is the .tar file associated with each image
 		devicePath := path + ".tar"
 		if fileutils.Exists(devicePath) != nil {
-			return nil, fmt.Errorf("no tar device file found for layer %s at %s", layerID, devicePath)
+			return nil, false, fmt.Errorf("no tar device file found for layer %s at %s", layerID, devicePath)
 		}
 		devicePaths = append(devicePaths, devicePath)
 	}
@@ -391,32 +408,53 @@ func (d *Driver) mountErofsMerged(containerID string, layers []string, mountLabe
 	args := append([]string{mergedImagePath}, imagePaths...)
 	logrus.Debugf("[imagefs] Creating merged EROFS: mkfs.erofs %v", args)
 	if err := d.mm.mounter.RunCommand("mkfs.erofs", args...); err != nil {
-		return nil, fmt.Errorf("failed to merge EROFS layers: %w", err)
+		return nil, false, fmt.Errorf("failed to merge EROFS layers: %w", err)
 	}
 
 	// When mounting the merged EROFS, we need to pass all the original
 	// device paths so erofsfuse can access the device files (including whiteouts)
 	// that were stored separately in the .tar files
 	isRoot := os.Getuid() == 0
-	mountPoint, err := d.mm.MountLayerWithDevices(containerID, "merged-layers", mergedImagePath, isRoot, devicePaths, mountLabel)
+	mountPoint, usedFuse, err := d.mm.MountLayerWithDevices(containerID, "merged-layers", mergedImagePath, isRoot, devicePaths, mountLabel)
 	if err != nil {
-		return nil, fmt.Errorf("failed to mount merged EROFS image: %w", err)
+		return nil, false, fmt.Errorf("failed to mount merged EROFS image: %w", err)
 	}
 
-	return []string{mountPoint}, nil
+	return []string{mountPoint}, usedFuse, nil
 }
 
 func (d *Driver) Put(id string) error {
 	// Unmount merged dir (only if it exists - read-only mounts don't create it)
 	mergedDir := filepath.Join(d.dir(id), "merged")
 	if fileutils.Exists(mergedDir) == nil {
-		if err := d.mm.mounter.Unmount(mergedDir); err != nil {
+		logrus.Debugf("[imagefs] Unmounting overlay at %s", mergedDir)
+		if err := d.unmountOverlay(mergedDir); err != nil {
 			logrus.Errorf("failed to unmount merged dir %s: %v", mergedDir, err)
 		}
 	}
 
 	// Unmount layers and cleanup rundir
 	return d.mm.CleanupRundir(id)
+}
+
+// unmountOverlay unmounts an overlay filesystem, handling both kernel and FUSE overlays.
+func (d *Driver) unmountOverlay(target string) error {
+	// Try normal unmount first
+	if err := d.mm.mounter.Unmount(target); err == nil {
+		logrus.Debugf("[imagefs] Successfully unmounted overlay: %s", target)
+		return nil
+	}
+
+	// If normal unmount fails, try fusermount -u for FUSE mounts
+	logrus.Debugf("[imagefs] Normal unmount failed, trying fusermount -u for %s", target)
+	cmd := exec.Command("fusermount", "-u", target)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("fusermount -u failed: %w: %s", err, stderr.String())
+	}
+	logrus.Debugf("[imagefs] Successfully unmounted FUSE overlay with fusermount: %s", target)
+	return nil
 }
 
 func (d *Driver) getLayerStack(id string) ([]string, error) {
@@ -533,6 +571,46 @@ func (d *Driver) ReadWriteDiskUsage(id string) (*directory.DiskUsage, error) {
 }
 
 func (d *Driver) Cleanup() error {
+	// Cleanup all FUSE mounts when storage is being shutdown (e.g., on Ctrl+C)
+	logrus.Debugf("[imagefs] Cleaning up all mounts")
+
+	// First, unmount all overlay mounts (merged directories)
+	homeEntries, err := os.ReadDir(d.home)
+	if err != nil && !os.IsNotExist(err) {
+		logrus.Errorf("[imagefs] Failed to read home directory %s: %v", d.home, err)
+	}
+	if err == nil {
+		for _, entry := range homeEntries {
+			if entry.IsDir() {
+				mergedDir := filepath.Join(d.home, entry.Name(), "merged")
+				if fileutils.Exists(mergedDir) == nil {
+					logrus.Debugf("[imagefs] Unmounting overlay at %s", mergedDir)
+					_ = d.unmountOverlay(mergedDir)
+				}
+			}
+		}
+	}
+
+	// Second, cleanup all FUSE layer mounts in rundir
+	runRoot := filepath.Join(d.runRoot, "imagefs")
+	runEntries, err := os.ReadDir(runRoot)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("failed to read runRoot %s: %w", runRoot, err)
+	}
+
+	for _, entry := range runEntries {
+		if entry.IsDir() {
+			containerID := entry.Name()
+			logrus.Debugf("[imagefs] Cleaning up FUSE mounts for container %s", containerID)
+			if err := d.mm.CleanupRundir(containerID); err != nil {
+				logrus.Errorf("[imagefs] Failed to cleanup rundir for container %s: %v", containerID, err)
+			}
+		}
+	}
+
 	return nil
 }
 

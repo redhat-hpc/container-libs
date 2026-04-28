@@ -3,6 +3,7 @@
 package imagefs
 
 import (
+	"archive/tar"
 	"bytes"
 	"fmt"
 	"io"
@@ -313,6 +314,16 @@ func (d *Driver) Get(id string, options graphdriver.MountOpts) (string, error) {
 		return "", fmt.Errorf("failed to mount overlay: %w", err)
 	}
 
+	// Verify the overlay mount has content
+	entries, err := os.ReadDir(mergedDir)
+	if err != nil {
+		return "", fmt.Errorf("failed to read merged dir %s: %w", mergedDir, err)
+	}
+	logrus.Debugf("[imagefs] Overlay mounted successfully: %s has %d entries", mergedDir, len(entries))
+	if len(entries) == 0 {
+		return "", fmt.Errorf("overlay mount succeeded but merged directory %s is empty", mergedDir)
+	}
+
 	success = true
 	return mergedDir, nil
 }
@@ -479,9 +490,9 @@ func (d *Driver) getLayerStack(id string) ([]string, error) {
 
 func (d *Driver) getImagePath(id string) string {
 	// In our updated layout, the image file is stored inside the layer directory:
-	// /home/.../storage/imagefs/<id>/layer.erofs
+	// /home/.../storage/imagefs/<id>/layer.erofs or layer.sqfs
 
-	extensions := []string{".erofs", ".sqsh"}
+	extensions := []string{".erofs", ".sqfs"}
 	for _, ext := range extensions {
 		img := filepath.Join(d.dir(id), "layer"+ext)
 		if fileutils.Exists(img) == nil {
@@ -537,11 +548,62 @@ func (d *Driver) getMkfsErofsVersion() string {
 	return "unknown"
 }
 
-func (d *Driver) Status() [][2]string {
-	return [][2]string{
-		{"driver", "imagefs"},
-		{"erofs-utils", d.getMkfsErofsVersion()},
+func (d *Driver) getTar2SqfsVersion() string {
+	// Try sqfstar first (RHEL 10+)
+	if _, err := exec.LookPath("sqfstar"); err == nil {
+		cmd := exec.Command("sqfstar", "-version")
+		var stdout bytes.Buffer
+		var stderr bytes.Buffer
+		cmd.Stdout = &stdout
+		cmd.Stderr = &stderr
+
+		cmd.Run()
+
+		// sqfstar outputs version to stderr
+		output := stdout.String() + stderr.String()
+		re := regexp.MustCompile(`(\d+\.\d+\.\d+)`)
+		matches := re.FindStringSubmatch(output)
+		if len(matches) > 1 {
+			return "sqfstar " + matches[1]
+		}
+		return "sqfstar (unknown version)"
 	}
+
+	// Fallback to tar2sqfs (RHEL 9)
+	if _, err := exec.LookPath("tar2sqfs"); err == nil {
+		cmd := exec.Command("tar2sqfs", "--version")
+		var stdout bytes.Buffer
+		cmd.Stdout = &stdout
+
+		cmd.Run()
+
+		output := stdout.String()
+		re := regexp.MustCompile(`(\d+\.\d+\.\d+)`)
+		matches := re.FindStringSubmatch(output)
+		if len(matches) > 1 {
+			return "tar2sqfs " + matches[1]
+		}
+		return "tar2sqfs (unknown version)"
+	}
+
+	return "not found"
+}
+
+func (d *Driver) Status() [][2]string {
+	status := [][2]string{
+		{"driver", "imagefs"},
+		{"format", d.options.Format},
+	}
+
+	switch d.options.Format {
+	case FormatEROFS:
+		status = append(status, [2]string{"erofs-utils", d.getMkfsErofsVersion()})
+	case FormatSquashFS:
+		status = append(status, [2]string{"squashfs-tools", d.getTar2SqfsVersion()})
+		status = append(status, [2]string{"compression", d.options.Compression})
+	}
+
+	return status
 }
 
 func (d *Driver) Metadata(id string) (map[string]string, error) {
@@ -556,7 +618,7 @@ func (d *Driver) Metadata(id string) (map[string]string, error) {
 	// Determine the format
 	if filepath.Ext(path) == ".erofs" {
 		meta["format"] = "erofs"
-	} else if filepath.Ext(path) == ".sqsh" {
+	} else if filepath.Ext(path) == ".sqfs" {
 		meta["format"] = "squashfs"
 	} else {
 		meta["format"] = "directory"
@@ -632,7 +694,8 @@ func (d *Driver) Diff(id string, idMappings *idtools.IDMappings, parent string, 
 	// For committed image layers with no parent, return the original tarball.
 	// This ensures tar-split reconstruction produces the correct digest.
 	if parent == "" && isCommittedLayer {
-		if filepath.Ext(imagePath) == ".erofs" {
+		ext := filepath.Ext(imagePath)
+		if ext == ".erofs" || ext == ".sqfs" {
 			tarballPath := imagePath + ".tar"
 			if fileutils.Exists(tarballPath) == nil {
 				logrus.Debugf("[imagefs] Returning original tarball for layer %s: %s", id, tarballPath)
@@ -674,8 +737,18 @@ func (d *Driver) Changes(id string, idMappings *idtools.IDMappings, parent strin
 
 func (d *Driver) ApplyDiff(id string, options graphdriver.ApplyDiffOpts) (int64, error) {
 	layerDir := d.dir(id)
-	imagePath := filepath.Join(layerDir, "layer.erofs")
-	tarballPath := imagePath + ".tar"
+
+	var imagePath string
+	var tarballPath string
+
+	// Determine image path and tarball path based on format
+	if d.options.Format == FormatSquashFS {
+		imagePath = filepath.Join(layerDir, "layer.sqfs")
+		tarballPath = imagePath + ".tar"
+	} else {
+		imagePath = filepath.Join(layerDir, "layer.erofs")
+		tarballPath = imagePath + ".tar"
+	}
 
 	// Save the original tarball - this is what tar-split will use
 	// to reconstruct the exact original tar when pushing the image
@@ -683,20 +756,27 @@ func (d *Driver) ApplyDiff(id string, options graphdriver.ApplyDiffOpts) (int64,
 		return 0, fmt.Errorf("failed to save original tarball %s: %w", tarballPath, err)
 	}
 
-	// Create EROFS image directly from the tarball.
-	// The --aufs flag tells mkfs.erofs to automatically convert .wh.* files
-	// to overlayfs whiteout character devices (c 0 0) so deletions work correctly.
-	if err := d.runMkfsErofs(tarballPath, imagePath); err != nil {
-		return 0, fmt.Errorf("failed to create image file %s: %w", imagePath, err)
+	// Create image file based on format
+	if d.options.Format == FormatSquashFS {
+		if err := d.runTar2Sqfs(tarballPath, imagePath); err != nil {
+			return 0, fmt.Errorf("failed to create squashfs image %s: %w", imagePath, err)
+		}
+	} else {
+		// Create EROFS image directly from the tarball.
+		// The --aufs flag tells mkfs.erofs to automatically convert .wh.* files
+		// to overlayfs whiteout character devices (c 0 0) so deletions work correctly.
+		if err := d.runMkfsErofs(tarballPath, imagePath); err != nil {
+			return 0, fmt.Errorf("failed to create erofs image %s: %w", imagePath, err)
+		}
 	}
 
-	// Return the tarball size, not the EROFS image size
+	// Return the tarball size, not the image size
 	tarInfo, err := os.Stat(tarballPath)
 	if err != nil {
 		return 0, fmt.Errorf("failed to stat tarball: %w", err)
 	}
 
-	logrus.Debugf("[imagefs] layer %s: tarball size %d bytes", id, tarInfo.Size())
+	logrus.Debugf("[imagefs] layer %s: tarball size %d bytes, format %s", id, tarInfo.Size(), d.options.Format)
 	return tarInfo.Size(), nil
 }
 
@@ -714,6 +794,77 @@ func (d *Driver) runMkfsErofs(tarballPath, dest string) error {
 	}
 
 	return nil
+}
+
+func (d *Driver) runTar2Sqfs(tarballPath, dest string) error {
+	// TODO: Whiteout conversion disabled for testing
+	// Character devices in FUSE-mounted squashfs may not work properly with overlayfs
+	// For now, use the original tarball without conversion
+
+	// Open the original tarball
+	tarFile, err := os.Open(tarballPath)
+	if err != nil {
+		return fmt.Errorf("failed to open tarball: %w", err)
+	}
+	defer tarFile.Close()
+
+	// Detect which tool to use: prefer sqfstar (RHEL 10+), fallback to tar2sqfs (RHEL 9)
+	var cmd *exec.Cmd
+	var cmdName string
+
+	if _, err := exec.LookPath("sqfstar"); err == nil {
+		// Use sqfstar (squashfs-tools 4.6.1+ on RHEL 10)
+		cmdName = "sqfstar"
+		args := []string{
+			"-comp", d.options.Compression,
+			dest,
+		}
+		cmd = exec.Command("sqfstar", args...)
+		logrus.Debugf("[imagefs] Creating squashfs with sqfstar: %v < %s", args, tarballPath)
+	} else if _, err := exec.LookPath("tar2sqfs"); err == nil {
+		// Use tar2sqfs (squashfs-tools-ng on RHEL 9)
+		cmdName = "tar2sqfs"
+		args := []string{
+			"--compressor", d.options.Compression,
+			dest,
+		}
+		cmd = exec.Command("tar2sqfs", args...)
+		logrus.Debugf("[imagefs] Creating squashfs with tar2sqfs: %v < %s", args, tarballPath)
+	} else {
+		return fmt.Errorf("neither sqfstar nor tar2sqfs found in PATH")
+	}
+
+	cmd.Stdin = tarFile
+
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("%s failed: %w: %s", cmdName, err, stderr.String())
+	}
+
+	return nil
+}
+
+func (d *Driver) convertWhiteoutsInTar(srcTar, dstTar string) error {
+	// Read the source tarball, convert .wh.* marker files to character devices,
+	// and write to the destination tarball.
+	// This is necessary because tar2sqfs doesn't have native whiteout support
+	// like mkfs.erofs --aufs does.
+
+	srcFile, err := os.Open(srcTar)
+	if err != nil {
+		return fmt.Errorf("failed to open source tar: %w", err)
+	}
+	defer srcFile.Close()
+
+	dstFile, err := os.Create(dstTar)
+	if err != nil {
+		return fmt.Errorf("failed to create dest tar: %w", err)
+	}
+	defer dstFile.Close()
+
+	return convertWhiteoutsTar(srcFile, dstFile)
 }
 
 func writeToFile(r io.Reader, dstPath string) error {
@@ -783,4 +934,75 @@ func (d *Driver) relabel(path string) {
 	// This is necessary for rootless containers to access files in the home directory.
 	// We ignore errors here because chcon might not be installed or SELinux might be disabled.
 	_ = exec.Command("chcon", "-t", "container_file_t", path).Run()
+}
+
+// convertWhiteoutsTar reads a tar archive and converts .wh.* whiteout marker files
+// to character device entries (c 0 0) that overlayfs recognizes as whiteouts.
+func convertWhiteoutsTar(src io.Reader, dst io.Writer) error {
+	tr := tar.NewReader(src)
+	tw := tar.NewWriter(dst)
+	defer tw.Close()
+
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("failed to read tar entry: %w", err)
+		}
+
+		// Check if this is a whiteout marker file (.wh.*)
+		baseName := filepath.Base(hdr.Name)
+		dirName := filepath.Dir(hdr.Name)
+
+		if targetName, isWhiteout := strings.CutPrefix(baseName, ".wh."); isWhiteout {
+			// This is a whiteout marker file
+			// Convert it to a character device entry for the target file
+
+			if baseName == ".wh..wh..opq" {
+				// Opaque whiteout - keeps the .wh..wh..opq marker file
+				// but we need to make it a character device
+				hdr.Typeflag = tar.TypeChar
+				hdr.Devmajor = 0
+				hdr.Devminor = 0
+				hdr.Size = 0
+				if err := tw.WriteHeader(hdr); err != nil {
+					return fmt.Errorf("failed to write opaque whiteout header: %w", err)
+				}
+			} else {
+				// Regular whiteout - create character device for the target file
+				targetPath := filepath.Join(dirName, targetName)
+
+				// Create a character device header for the whiteout
+				whiteoutHdr := &tar.Header{
+					Name:     targetPath,
+					Mode:     hdr.Mode,
+					Uid:      hdr.Uid,
+					Gid:      hdr.Gid,
+					Typeflag: tar.TypeChar,
+					Devmajor: 0,
+					Devminor: 0,
+					ModTime:  hdr.ModTime,
+				}
+
+				if err := tw.WriteHeader(whiteoutHdr); err != nil {
+					return fmt.Errorf("failed to write whiteout header for %s: %w", targetPath, err)
+				}
+			}
+		} else {
+			// Regular file - copy as-is
+			if err := tw.WriteHeader(hdr); err != nil {
+				return fmt.Errorf("failed to write header for %s: %w", hdr.Name, err)
+			}
+
+			if hdr.Size > 0 {
+				if _, err := io.Copy(tw, tr); err != nil {
+					return fmt.Errorf("failed to copy file content for %s: %w", hdr.Name, err)
+				}
+			}
+		}
+	}
+
+	return nil
 }

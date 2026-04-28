@@ -190,7 +190,7 @@ func openBlobFile(blobFile, fsType string, useLoopDevice bool, devices []string,
 func (m *MountManager) mountRoot(source, target string, devices []string, mountLabel string) error {
 	// Detect filesystem type
 	fsType := "erofs"
-	if filepath.Ext(source) == ".sqsh" {
+	if filepath.Ext(source) == ".sqfs" {
 		fsType = "squashfs"
 	}
 
@@ -233,10 +233,17 @@ func (m *MountManager) mountRoot(source, target string, devices []string, mountL
 
 func (m *MountManager) mountRootlessWithDevices(source, target string, devices []string) error {
 	var cmdName string
-	if filepath.Ext(source) == ".sqsh" {
+	if filepath.Ext(source) == ".sqfs" {
 		cmdName = "squashfuse"
 	} else {
 		cmdName = "erofsfuse"
+	}
+
+	// Check if fusermount is available (required for FUSE mounts)
+	if _, err := exec.LookPath("fusermount3"); err != nil {
+		if _, err := exec.LookPath("fusermount"); err != nil {
+			return fmt.Errorf("%s requires fusermount or fusermount3", cmdName)
+		}
 	}
 
 	// FUSE mount options for overlay compatibility:
@@ -256,6 +263,17 @@ func (m *MountManager) mountRootlessWithDevices(source, target string, devices [
 	if err := m.mounter.RunCommand(cmdName, args...); err != nil {
 		return fmt.Errorf("rootless mount failed: %w", err)
 	}
+
+	// Verify the mount actually succeeded by checking if the directory has content
+	entries, err := os.ReadDir(target)
+	if err != nil {
+		return fmt.Errorf("failed to verify mount at %s: %w", target, err)
+	}
+	if len(entries) == 0 {
+		return fmt.Errorf("mount succeeded but %s is empty - %s may have failed silently", target, cmdName)
+	}
+
+	logrus.Debugf("[imagefs] Mount verified: %s has %d entries", target, len(entries))
 	return nil
 }
 

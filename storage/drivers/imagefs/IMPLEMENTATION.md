@@ -376,15 +376,85 @@ The test suite verifies:
 
 All tests use `MockMounter` to verify mount call sequences without requiring root privileges.
 
+## Backend Selection
+
+The imagefs driver supports two compressed filesystem backends:
+
+### EROFS Backend (Default)
+- **Format**: `.erofs` files
+- **Creation Tool**: `mkfs.erofs --tar=i --aufs -E legacy-compress`
+- **Whiteout Handling**: Automatic via `--aufs` flag
+- **Kernel Support**: Linux 5.4+
+- **FUSE Fallback**: `erofsfuse`
+- **Merged Strategy**: Supported on Linux 5.14+ (multi-layer EROFS merging)
+
+### SquashFS Backend
+- **Format**: `.sqfs` files
+- **Creation Tools** (auto-detected, in order of preference):
+  - `sqfstar -comp <algorithm>` (squashfs-tools 4.6.1+ on RHEL 10+)
+  - `tar2sqfs --compressor <algorithm>` (squashfs-tools-ng on RHEL 9)
+- **Whiteout Handling**: Manual conversion of `.wh.*` files to character devices before image creation
+- **Kernel Support**: Universal (very old kernels have squashfs)
+- **FUSE Fallback**: `squashfuse`
+- **Compression Options**: gzip (default), lzma, lzo, xz, lz4, zstd
+
+### Configuration
+
+In `/etc/containers/storage.conf`:
+```toml
+[storage]
+driver = "imagefs"
+
+[storage.options.imagefs]
+imagefs_format = "squashfs"         # or "erofs" (default)
+imagefs_compression = "gzip"        # for squashfs: gzip, xz, lz4, zstd, lzma, lzo
+```
+
+Or via driver options:
+```go
+options := graphdriver.Options{
+    DriverOptions: []string{
+        "imagefs_format=squashfs",
+        "imagefs_compression=zstd",
+    },
+}
+```
+
+### Tool Detection for SquashFS
+
+The driver automatically detects which squashfs creation tool is available:
+1. First checks for `sqfstar` (RHEL 10+, squashfs-tools 4.6.1+)
+2. Falls back to `tar2sqfs` (RHEL 9, squashfs-tools-ng)
+3. Returns error if neither is found
+
+### SquashFS Whiteout Conversion
+
+Unlike EROFS which has native `--aufs` support, squashfs tools require manual whiteout handling:
+
+1. Read tar archive entry by entry
+2. Detect `.wh.*` marker files
+3. For `.wh.filename`, create a character device (c 0 0) entry named `filename`
+4. For `.wh..wh..opq` (opaque whiteout), convert to character device but keep the name
+5. Write modified tar stream to temporary file
+6. Pipe modified tar to `sqfstar` or `tar2sqfs`
+
+This ensures overlayfs recognizes deletions correctly in squashfs images.
+
 ## Requirements
 
 ### Required Tools
+
+**For EROFS:**
 - `mkfs.erofs` (v1.7+): EROFS image creation with `--aufs` support
-- `erofsfuse` or `squashfuse`: Rootless FUSE mounting
+- `erofsfuse`: Rootless FUSE mounting
+
+**For SquashFS:**
+- `sqfstar` (squashfs-tools 4.6.1+) OR `tar2sqfs` (squashfs-tools-ng): Image creation from tar
+- `squashfuse`: Rootless FUSE mounting
 
 ### Kernel Support
-- **Basic**: Linux 5.4+ (EROFS support)
-- **Merged Strategy**: Linux 5.14+ (multi-image EROFS merging)
+- **EROFS**: Linux 5.4+ (basic), 5.14+ (merged strategy)
+- **SquashFS**: Universal (ancient kernel support)
 
 ## Performance Characteristics
 

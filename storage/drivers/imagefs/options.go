@@ -6,10 +6,9 @@ import (
 )
 
 // Options represents the configuration for the imagefs storage driver.
-// This struct is currently a placeholder and does not define any driver-specific options.
-// Driver-specific options can be added as the implementation evolves.
 type Options struct {
-	Format string
+	Format      string
+	Compression string // squashfs compression algorithm (gzip, xz, lz4, zstd)
 }
 
 const (
@@ -20,7 +19,8 @@ const (
 // parseOptions processes driver options from the storage configuration.
 func parseOptions(options []string) (*Options, error) {
 	opts := &Options{
-		Format: FormatEROFS,
+		Format:      FormatEROFS,
+		Compression: "gzip", // default compression for squashfs
 	}
 
 	for _, opt := range options {
@@ -30,6 +30,21 @@ func parseOptions(options []string) (*Options, error) {
 				return nil, fmt.Errorf("imagefs: invalid format %q, must be %s or %s", format, FormatEROFS, FormatSquashFS)
 			}
 			opts.Format = format
+		} else if strings.HasPrefix(opt, "imagefs_compression=") {
+			compression := strings.TrimPrefix(opt, "imagefs_compression=")
+			// Validate compression algorithm
+			validCompressors := []string{"gzip", "lzma", "lzo", "xz", "lz4", "zstd"}
+			valid := false
+			for _, c := range validCompressors {
+				if compression == c {
+					valid = true
+					break
+				}
+			}
+			if !valid {
+				return nil, fmt.Errorf("imagefs: invalid compression %q, must be one of: %v", compression, validCompressors)
+			}
+			opts.Compression = compression
 		}
 	}
 	return opts, nil

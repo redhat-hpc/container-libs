@@ -118,10 +118,10 @@ func TestDriver_Get_SeparateLayersStrategy(t *testing.T) {
 		},
 	}
 
-	// Setup layers: L1 (.erofs) -> L2 (.sqsh) -> L3 (.erofs)
+	// Setup layers: L1 (.erofs) -> L2 (.sqfs) -> L3 (.erofs)
 	// Mixed types should use separate layers strategy
 	layers := []string{"L1", "L2", "L3"}
-	exts := []string{".erofs", ".sqsh", ".erofs"}
+	exts := []string{".erofs", ".sqfs", ".erofs"}
 	for i, l := range layers {
 		dir := filepath.Join(tmpDir, l)
 		os.MkdirAll(dir, 0755)

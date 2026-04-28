@@ -74,24 +74,25 @@ func (m *MountManager) GetRundir(containerID string) string {
 	return filepath.Join(m.runRoot, "imagefs", containerID)
 }
 
-func (m *MountManager) MountLayer(containerID, layerID, imagePath string, isRoot bool) (string, error) {
+func (m *MountManager) MountLayer(containerID, layerID, imagePath string, isRoot bool) (string, bool, error) {
 	return m.MountLayerWithDevices(containerID, layerID, imagePath, isRoot, nil, "")
 }
 
-func (m *MountManager) MountLayerWithDevices(containerID, layerID, imagePath string, isRoot bool, devices []string, mountLabel string) (string, error) {
+func (m *MountManager) MountLayerWithDevices(containerID, layerID, imagePath string, isRoot bool, devices []string, mountLabel string) (string, bool, error) {
 	rundir := m.GetRundir(containerID)
 	layerDir := filepath.Join(rundir, layerID)
 
 	if err := os.MkdirAll(layerDir, 0755); err != nil {
-		return "", fmt.Errorf("failed to create layer dir %s: %w", layerDir, err)
+		return "", false, fmt.Errorf("failed to create layer dir %s: %w", layerDir, err)
 	}
 
 	// Attempt to mount the layer.
 	// If we think we are root, try the kernel mount first.
 	if isRoot {
+		logrus.Debugf("[imagefs] Attempting kernel mount for layer %s (rootful mode)", layerID)
 		err := m.mountRoot(imagePath, layerDir, devices, mountLabel)
 		if err == nil {
-			return layerDir, nil
+			return layerDir, false, nil // Successfully used kernel mount
 		}
 
 		// If the kernel mount failed due to permissions (EPERM),
@@ -105,16 +106,18 @@ func (m *MountManager) MountLayerWithDevices(containerID, layerID, imagePath str
 		} else if errors.Is(err, unix.ENOTBLK) || strings.Contains(err.Error(), "block device") {
 			logrus.Debugf("[imagefs] Kernel mount requires block device, falling back to FUSE for layer %s", layerID)
 		} else {
-			return "", err
+			return "", false, err
 		}
+	} else {
+		logrus.Debugf("[imagefs] Using FUSE mount for layer %s (rootless mode)", layerID)
 	}
 
 	// Rootless path: Use FUSE mounts.
 	if err := m.mountRootlessWithDevices(imagePath, layerDir, devices); err != nil {
-		return "", fmt.Errorf("rootless mount failed for layer %s: %w", layerID, err)
+		return "", false, fmt.Errorf("rootless mount failed for layer %s: %w", layerID, err)
 	}
 
-	return layerDir, nil
+	return layerDir, true, nil // Used FUSE mount
 }
 
 // openBlobFile mounts an EROFS or squashfs image file using the new mount API.
@@ -228,10 +231,6 @@ func (m *MountManager) mountRoot(source, target string, devices []string, mountL
 	return nil
 }
 
-func (m *MountManager) mountRootless(source, target string) error {
-	return m.mountRootlessWithDevices(source, target, nil)
-}
-
 func (m *MountManager) mountRootlessWithDevices(source, target string, devices []string) error {
 	var cmdName string
 	if filepath.Ext(source) == ".sqsh" {
@@ -240,6 +239,10 @@ func (m *MountManager) mountRootlessWithDevices(source, target string, devices [
 		cmdName = "erofsfuse"
 	}
 
+	// FUSE mount options for overlay compatibility:
+	// - allow_other: allow other users to access the mount
+	// - default_permissions: enable kernel permission checking
+	// Note: Removed direct_io and use_ino as they may interfere with overlay copy-up
 	args := []string{"-o", "allow_other,default_permissions", source, target}
 
 	// Add device arguments before the source
@@ -250,8 +253,6 @@ func (m *MountManager) mountRootlessWithDevices(source, target string, devices [
 		}
 		args = append(deviceArgs, args...)
 	}
-
-	logrus.Debugf("[imagefs] Rootless mounting layer via %s: %s -> %s (devices: %v)", cmdName, source, target, devices)
 	if err := m.mounter.RunCommand(cmdName, args...); err != nil {
 		return fmt.Errorf("rootless mount failed: %w", err)
 	}
@@ -259,12 +260,22 @@ func (m *MountManager) mountRootlessWithDevices(source, target string, devices [
 }
 
 func (m *MountManager) UnmountLayer(target string) error {
+	// Try normal unmount first
 	err := m.mounter.Unmount(target)
-	if err != nil {
-		logrus.Debugf("mounter.Unmount failed for %s, trying lazy umount: %v", target, err)
-		if err := m.mounter.LazyUnmount(target); err != nil {
-			return fmt.Errorf("failed to unmount %s: %w", target, err)
-		}
+	if err == nil {
+		return nil
+	}
+
+	logrus.Debugf("[imagefs] Normal unmount failed for %s, trying lazy umount: %v", target, err)
+	err = m.mounter.LazyUnmount(target)
+	if err == nil {
+		return nil
+	}
+
+	// Try fusermount -u for FUSE mounts
+	logrus.Debugf("[imagefs] Lazy unmount failed for %s, trying fusermount -u: %v", target, err)
+	if err := m.mounter.RunCommand("fusermount", "-u", target); err != nil {
+		return fmt.Errorf("failed to unmount %s (tried unmount, lazy unmount, and fusermount): %w", target, err)
 	}
 	return nil
 }
@@ -283,8 +294,14 @@ func (m *MountManager) CleanupRundir(containerID string) error {
 	for _, entry := range entries {
 		if entry.IsDir() {
 			path := filepath.Join(rundir, entry.Name())
-			// We use lazy unmount to ensure we break the link even if files are open.
-			_ = m.mounter.LazyUnmount(path)
+			logrus.Debugf("[imagefs] Unmounting layer at %s", path)
+
+			// Try lazy unmount first
+			if err := m.mounter.LazyUnmount(path); err != nil {
+				// If lazy unmount fails, try fusermount -u for FUSE mounts
+				logrus.Debugf("[imagefs] Lazy unmount failed for %s, trying fusermount -u: %v", path, err)
+				_ = m.mounter.RunCommand("fusermount", "-u", path)
+			}
 		}
 	}
 

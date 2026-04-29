@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 
 	"github.com/sirupsen/logrus"
 	graphdriver "go.podman.io/storage/drivers"
@@ -23,6 +24,7 @@ import (
 
 const parentFileName = "parent"
 
+
 type Driver struct {
 	home      string
 	runRoot   string
@@ -31,6 +33,10 @@ type Driver struct {
 	mm        *MountManager
 	syncMode  graphdriver.SyncMode
 	naiveDiff graphdriver.DiffDriver
+
+	// Track active mounts for cleanup
+	activeMountsMu sync.Mutex
+	activeMounts   map[string]bool // containerID -> true
 }
 
 func Init(home string, options graphdriver.Options) (graphdriver.Driver, error) {
@@ -52,14 +58,19 @@ func Init(home string, options graphdriver.Options) (graphdriver.Driver, error) 
 	}
 
 	d := &Driver{
-		home:     home,
-		runRoot:  options.RunRoot,
-		options:  *opts,
-		backend:  backend,
-		mm:       NewMountManager(options.RunRoot, nil),
-		syncMode: graphdriver.SyncModeNone, // Default to no sync
+		home:         home,
+		runRoot:      options.RunRoot,
+		options:      *opts,
+		backend:      backend,
+		mm:           NewMountManager(options.RunRoot, nil),
+		syncMode:     graphdriver.SyncModeNone, // Default to no sync
+		activeMounts: make(map[string]bool),
 	}
 	d.naiveDiff = graphdriver.NewNaiveDiffDriver(d, graphdriver.NewNaiveLayerIDMapUpdater(d))
+
+	// Clean up any orphaned FUSE processes from previous interrupted builds
+	d.cleanupOrphanedProcesses()
+
 	return d, nil
 }
 
@@ -204,6 +215,12 @@ func (d *Driver) Get(id string, options graphdriver.MountOpts) (string, error) {
 			return "", fmt.Errorf("failed to mount layer %s read-only: %w", id, err)
 		}
 		success = true
+
+		// Track this container as actively mounted
+		d.activeMountsMu.Lock()
+		d.activeMounts[containerID] = true
+		d.activeMountsMu.Unlock()
+
 		return mountPoint, nil
 	}
 
@@ -336,6 +353,12 @@ func (d *Driver) Get(id string, options graphdriver.MountOpts) (string, error) {
 	}
 
 	success = true
+
+	// Track this container as actively mounted
+	d.activeMountsMu.Lock()
+	d.activeMounts[containerID] = true
+	d.activeMountsMu.Unlock()
+
 	return mergedDir, nil
 }
 
@@ -444,29 +467,45 @@ func (d *Driver) Put(id string) error {
 	if fileutils.Exists(mergedDir) == nil {
 		logrus.Debugf("[imagefs] Unmounting overlay at %s", mergedDir)
 		if err := d.unmountOverlay(mergedDir); err != nil {
-			logrus.Errorf("failed to unmount merged dir %s: %v", mergedDir, err)
+			logrus.Errorf("[imagefs] Failed to unmount merged dir %s: %v", mergedDir, err)
 		}
 	}
 
 	// Unmount layers and cleanup rundir
-	return d.mm.CleanupRundir(id)
+	logrus.Debugf("[imagefs] Cleaning up rundir for container %s", id)
+	err := d.mm.CleanupRundir(id)
+
+	// Remove from active mounts tracking
+	d.activeMountsMu.Lock()
+	delete(d.activeMounts, id)
+	d.activeMountsMu.Unlock()
+
+	return err
 }
 
 // unmountOverlay unmounts an overlay filesystem, handling both kernel and FUSE overlays.
 func (d *Driver) unmountOverlay(target string) error {
-	// Try normal unmount first
-	if err := d.mm.mounter.Unmount(target); err == nil {
+	// Try normal unmount first (works for kernel overlay)
+	err := d.mm.mounter.Unmount(target)
+	if err == nil {
 		logrus.Debugf("[imagefs] Successfully unmounted overlay: %s", target)
 		return nil
 	}
 
-	// If normal unmount fails, try fusermount -u for FUSE mounts
-	logrus.Debugf("[imagefs] Normal unmount failed, trying fusermount -u for %s", target)
+	logrus.Debugf("[imagefs] Normal unmount failed for %s, trying lazy unmount: %v", target, err)
+	err = d.mm.mounter.LazyUnmount(target)
+	if err == nil {
+		logrus.Debugf("[imagefs] Successfully lazy unmounted overlay: %s", target)
+		return nil
+	}
+
+	// If normal and lazy unmount fail, try fusermount -u for FUSE overlays
+	logrus.Debugf("[imagefs] Lazy unmount failed for %s, trying fusermount -u: %v", target, err)
 	cmd := exec.Command("fusermount", "-u", target)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("fusermount -u failed: %w: %s", err, stderr.String())
+		return fmt.Errorf("failed to unmount overlay %s (tried unmount, lazy unmount, and fusermount): %w: %s", target, err, stderr.String())
 	}
 	logrus.Debugf("[imagefs] Successfully unmounted FUSE overlay with fusermount: %s", target)
 	return nil
@@ -558,47 +597,80 @@ func (d *Driver) ReadWriteDiskUsage(id string) (*directory.DiskUsage, error) {
 }
 
 func (d *Driver) Cleanup() error {
-	// Cleanup all FUSE mounts when storage is being shutdown (e.g., on Ctrl+C)
-	logrus.Debugf("[imagefs] Cleaning up all mounts")
+	// Cleanup all FUSE mounts when storage is being shutdown
+	// Note: During Ctrl+C, podman kills us before this runs, so orphaned processes
+	// will be cleaned up on next podman invocation by cleanupOrphanedProcesses()
+	logrus.Debugf("[imagefs] Starting cleanup of all active mounts")
 
-	// First, unmount all overlay mounts (merged directories)
-	homeEntries, err := os.ReadDir(d.home)
-	if err != nil && !os.IsNotExist(err) {
-		logrus.Errorf("[imagefs] Failed to read home directory %s: %v", d.home, err)
-	}
-	if err == nil {
-		for _, entry := range homeEntries {
-			if entry.IsDir() {
-				mergedDir := filepath.Join(d.home, entry.Name(), "merged")
-				if fileutils.Exists(mergedDir) == nil {
-					logrus.Debugf("[imagefs] Unmounting overlay at %s", mergedDir)
-					_ = d.unmountOverlay(mergedDir)
+	// Get list of containers that need cleanup (only those actively mounted)
+	// Do this as fast as possible - no logging, no checks, just fire fusermount commands
+	d.activeMountsMu.Lock()
+
+	// Immediately fire all unmount commands while holding the lock (to prevent race)
+	for containerID := range d.activeMounts {
+		// Fire and forget - lazy unmount overlay (merged directory)
+		mergedDir := filepath.Join(d.home, containerID, "merged")
+		exec.Command("fusermount", "-uz", mergedDir).Start()
+
+		// Fire and forget - lazy unmount all FUSE layer mounts in rundir
+		rundir := d.mm.GetRundir(containerID)
+		if entries, err := os.ReadDir(rundir); err == nil {
+			for _, entry := range entries {
+				if entry.IsDir() {
+					path := filepath.Join(rundir, entry.Name())
+					exec.Command("fusermount", "-uz", path).Start()
 				}
 			}
 		}
 	}
 
-	// Second, cleanup all FUSE layer mounts in rundir
-	runRoot := filepath.Join(d.runRoot, "imagefs")
-	runEntries, err := os.ReadDir(runRoot)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return fmt.Errorf("failed to read runRoot %s: %w", runRoot, err)
-	}
+	// Clear the map
+	clear(d.activeMounts)
+	d.activeMountsMu.Unlock()
 
-	for _, entry := range runEntries {
-		if entry.IsDir() {
-			containerID := entry.Name()
-			logrus.Debugf("[imagefs] Cleaning up FUSE mounts for container %s", containerID)
-			if err := d.mm.CleanupRundir(containerID); err != nil {
-				logrus.Errorf("[imagefs] Failed to cleanup rundir for container %s: %v", containerID, err)
+	logrus.Debugf("[imagefs] Cleanup complete, all unmount commands issued")
+
+	return nil
+}
+
+// cleanupOrphanedProcesses cleans up any FUSE processes left over from previous interrupted builds.
+// Called during Init() to ensure clean state.
+func (d *Driver) cleanupOrphanedProcesses() {
+	logrus.Debugf("[imagefs] Checking for orphaned FUSE mounts from previous builds...")
+
+	// Clean up any layer mounts in runRoot/imagefs
+	runRoot := filepath.Join(d.runRoot, "imagefs")
+	if runEntries, err := os.ReadDir(runRoot); err == nil {
+		for _, containerEntry := range runEntries {
+			if containerEntry.IsDir() {
+				containerDir := filepath.Join(runRoot, containerEntry.Name())
+				if layerEntries, err := os.ReadDir(containerDir); err == nil {
+					for _, layerEntry := range layerEntries {
+						if layerEntry.IsDir() {
+							layerPath := filepath.Join(containerDir, layerEntry.Name())
+							// Try to unmount - if it's not mounted, this will fail silently
+							exec.Command("fusermount", "-uz", layerPath).Run()
+						}
+					}
+				}
+				// Try to remove the container directory
+				os.RemoveAll(containerDir)
 			}
 		}
 	}
 
-	return nil
+	// Clean up any overlay mounts in home/*/merged
+	if homeEntries, err := os.ReadDir(d.home); err == nil {
+		for _, entry := range homeEntries {
+			if entry.IsDir() {
+				mergedDir := filepath.Join(d.home, entry.Name(), "merged")
+				// Try to unmount - if it's not mounted, this will fail silently
+				exec.Command("fusermount", "-uz", mergedDir).Run()
+			}
+		}
+	}
+
+	logrus.Debugf("[imagefs] Orphaned FUSE mount cleanup complete")
 }
 
 func (d *Driver) AdditionalImageStores() []string {

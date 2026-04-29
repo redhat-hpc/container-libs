@@ -161,6 +161,42 @@ For `--userns` mappings, creates symlinks to template image files instead of cop
 | Kernel support | 5.4+ | 2.6.29+ |
 | Tools | mkfs.erofs, erofsfuse | sqfstar/tar2sqfs, squashfuse |
 
+## Cleanup and Lifecycle
+
+### Normal Shutdown
+
+When `podman` exits normally (build completes, container stops, etc.):
+1. `Put()` is called for each mounted container
+2. Overlay is unmounted from `merged/`
+3. Layer mounts are unmounted via `MountManager.CleanupRundir()`
+4. `Cleanup()` is called on driver shutdown
+5. All FUSE processes terminate cleanly
+
+### Interrupted Builds (Ctrl+C)
+
+**Problem:** FUSE processes (`erofsfuse`, `fuse-overlayfs`) outlive the podman process when interrupted.
+
+**Why it happens:**
+- Both podman's shutdown handler and driver receive SIGINT simultaneously
+- Podman terminates the process before driver cleanup can complete
+- Kernel mounts auto-cleanup, but FUSE processes remain
+
+**Solution:** Lazy cleanup on next invocation
+- `cleanupOrphanedProcesses()` runs during `Init()`
+- Scans for leftover mounts in `runRoot/imagefs/` and `home/*/merged`
+- Issues `fusermount -uz` on all found mounts
+- Removes empty directories
+- Next podman command automatically cleans up orphaned processes
+
+**This matches overlay driver behavior:** Overlay leaves kernel mounts behind on Ctrl+C (cleaned up on next use), imagefs leaves FUSE processes (also cleaned up on next use).
+
+### Active Mount Tracking
+
+Driver tracks which containers are currently mounted:
+- `activeMounts` map populated on `Get()` success
+- Cleared on `Put()` or during `Cleanup()`
+- Only actively mounted containers are cleaned up (not entire storage)
+
 ## Future Work
 
 - Implement SquashFS whiteout conversion

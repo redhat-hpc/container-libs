@@ -766,6 +766,21 @@ func (d *Driver) ApplyDiff(id string, options graphdriver.ApplyDiffOpts) (int64,
 		return 0, fmt.Errorf("failed to create %s image: %w", d.backend.Format(), err)
 	}
 
+	// Clean up upperdir and workdir since this layer is now committed.
+	// Any previous content in upperdir is obsolete - the committed content is in the EROFS image.
+	upperdir := filepath.Join(layerDir, "upper")
+	workdir := filepath.Join(layerDir, "work")
+	if fileutils.Exists(upperdir) == nil {
+		if err := os.RemoveAll(upperdir); err != nil {
+			logrus.Warnf("[imagefs] Failed to clean upperdir for committed layer %s: %v", id, err)
+		}
+	}
+	if fileutils.Exists(workdir) == nil {
+		if err := os.RemoveAll(workdir); err != nil {
+			logrus.Warnf("[imagefs] Failed to clean workdir for committed layer %s: %v", id, err)
+		}
+	}
+
 	logrus.Debugf("[imagefs] layer %s: %s created, size %d bytes", id, d.backend.Format(), size)
 	return size, nil
 }

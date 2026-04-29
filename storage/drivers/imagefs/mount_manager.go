@@ -314,11 +314,10 @@ func (m *MountManager) CleanupRundir(containerID string) error {
 			path := filepath.Join(rundir, entry.Name())
 			logrus.Debugf("[imagefs] Unmounting layer at %s", path)
 
-			// Try lazy unmount first
-			if err := m.mounter.LazyUnmount(path); err != nil {
-				// If lazy unmount fails, try fusermount -u for FUSE mounts
-				logrus.Debugf("[imagefs] Lazy unmount failed for %s, trying fusermount -u: %v", path, err)
-				_ = m.mounter.RunCommand("fusermount", "-u", path)
+			// Use UnmountLayer which properly handles kernel and FUSE unmounting
+			if err := m.UnmountLayer(path); err != nil {
+				logrus.Errorf("[imagefs] Failed to unmount layer %s: %v", path, err)
+				// Continue trying to unmount other layers even if one fails
 			}
 		}
 	}

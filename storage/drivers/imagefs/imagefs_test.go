@@ -3,6 +3,7 @@
 package imagefs
 
 import (
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -33,6 +34,41 @@ type MountCall struct {
 type RunCommandCall struct {
 	Name string
 	Args []string
+}
+
+// MockBackend is a simple mock implementation of the Backend interface for testing
+type MockBackend struct{}
+
+func (m *MockBackend) Format() string {
+	return "erofs"
+}
+
+func (m *MockBackend) FileExtension() string {
+	return ".erofs"
+}
+
+func (m *MockBackend) CreateImage(tarballPath, destImagePath string) (int64, error) {
+	return 0, nil
+}
+
+func (m *MockBackend) CanMergeLayers(imagePaths []string) bool {
+	return true
+}
+
+func (m *MockBackend) MergeLayers(imagePaths []string, devicePaths []string, mergedImagePath string) error {
+	return nil
+}
+
+func (m *MockBackend) ShouldPreserveTarball() bool {
+	return true
+}
+
+func (m *MockBackend) GetDiffForBaseLayer(imagePath string) (io.ReadCloser, error) {
+	return nil, nil
+}
+
+func (m *MockBackend) StatusFields() [][2]string {
+	return [][2]string{{"mock-backend", "1.0.0"}}
 }
 
 func (m *MockMounter) Mount(source, target, fsType, options string) error {
@@ -69,8 +105,10 @@ func TestDriver_Get_MergedErofsStrategy(t *testing.T) {
 
 	mockMounter := &MockMounter{}
 	d := &Driver{
-		home:    tmpDir,
-		runRoot: runRoot,
+		home:         tmpDir,
+		runRoot:      runRoot,
+		backend:      &MockBackend{},
+		activeMounts: make(map[string]bool),
 		mm: &MountManager{
 			runRoot: runRoot,
 			mounter: mockMounter,
@@ -110,8 +148,10 @@ func TestDriver_Get_SeparateLayersStrategy(t *testing.T) {
 
 	mockMounter := &MockMounter{}
 	d := &Driver{
-		home:    tmpDir,
-		runRoot: runRoot,
+		home:         tmpDir,
+		runRoot:      runRoot,
+		backend:      &MockBackend{},
+		activeMounts: make(map[string]bool),
 		mm: &MountManager{
 			runRoot: runRoot,
 			mounter: mockMounter,
@@ -152,8 +192,10 @@ func TestDriver_Put(t *testing.T) {
 
 	mockMounter := &MockMounter{}
 	d := &Driver{
-		home:    tmpDir,
-		runRoot: runRoot,
+		home:         tmpDir,
+		runRoot:      runRoot,
+		backend:      &MockBackend{},
+		activeMounts: make(map[string]bool),
 		mm: &MountManager{
 			runRoot: runRoot,
 			mounter: mockMounter,
@@ -178,8 +220,10 @@ func TestDriver_Get_EmptyLayers(t *testing.T) {
 
 	mockMounter := &MockMounter{}
 	d := &Driver{
-		home:    tmpDir,
-		runRoot: runRoot,
+		home:         tmpDir,
+		runRoot:      runRoot,
+		backend:      &MockBackend{},
+		activeMounts: make(map[string]bool),
 		mm: &MountManager{
 			runRoot: runRoot,
 			mounter: mockMounter,
@@ -257,8 +301,10 @@ func TestDriver_Get_WorkingContainerLayer(t *testing.T) {
 
 	mockMounter := &MockMounter{}
 	d := &Driver{
-		home:    tmpDir,
-		runRoot: runRoot,
+		home:         tmpDir,
+		runRoot:      runRoot,
+		backend:      &MockBackend{},
+		activeMounts: make(map[string]bool),
 		mm: &MountManager{
 			runRoot: runRoot,
 			mounter: mockMounter,
@@ -293,8 +339,10 @@ func TestDriver_Get_DockerfileScenario(t *testing.T) {
 
 	mockMounter := &MockMounter{}
 	d := &Driver{
-		home:    tmpDir,
-		runRoot: runRoot,
+		home:         tmpDir,
+		runRoot:      runRoot,
+		backend:      &MockBackend{},
+		activeMounts: make(map[string]bool),
 		mm: &MountManager{
 			runRoot: runRoot,
 			mounter: mockMounter,

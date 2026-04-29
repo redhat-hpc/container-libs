@@ -547,9 +547,23 @@ func (d *Driver) getMkfsErofsVersion() string {
 	return "unknown"
 }
 
-func (d *Driver) getTar2SqfsVersion() string {
-	// Try sqfstar first (RHEL 10+)
+// getSquashfsToolType returns which squashfs tool is available on the system.
+// Returns "sqfstar", "tar2sqfs", or "" if neither is found.
+func (d *Driver) getSquashfsToolType() string {
 	if _, err := exec.LookPath("sqfstar"); err == nil {
+		return "sqfstar"
+	}
+	if _, err := exec.LookPath("tar2sqfs"); err == nil {
+		return "tar2sqfs"
+	}
+	return ""
+}
+
+func (d *Driver) getTar2SqfsVersion() string {
+	toolType := d.getSquashfsToolType()
+
+	switch toolType {
+	case "sqfstar":
 		cmd := exec.Command("sqfstar", "-version")
 		var stdout bytes.Buffer
 		var stderr bytes.Buffer
@@ -566,10 +580,8 @@ func (d *Driver) getTar2SqfsVersion() string {
 			return "sqfstar " + matches[1]
 		}
 		return "sqfstar (unknown version)"
-	}
 
-	// Fallback to tar2sqfs (RHEL 9)
-	if _, err := exec.LookPath("tar2sqfs"); err == nil {
+	case "tar2sqfs":
 		cmd := exec.Command("tar2sqfs", "--version")
 		var stdout bytes.Buffer
 		cmd.Stdout = &stdout
@@ -583,9 +595,10 @@ func (d *Driver) getTar2SqfsVersion() string {
 			return "tar2sqfs " + matches[1]
 		}
 		return "tar2sqfs (unknown version)"
-	}
 
-	return "not found"
+	default:
+		return "not found"
+	}
 }
 
 func (d *Driver) Status() [][2]string {
@@ -594,12 +607,22 @@ func (d *Driver) Status() [][2]string {
 		{"format", d.options.Format},
 	}
 
+	// Show compression if specified
+	compression := d.options.Compression
+	if compression == "" {
+		compression = "none"
+	}
+	status = append(status, [2]string{"compression", compression})
+
 	switch d.options.Format {
 	case FormatEROFS:
 		status = append(status, [2]string{"erofs-utils", d.getMkfsErofsVersion()})
 	case FormatSquashFS:
+		toolType := d.getSquashfsToolType()
+		if toolType != "" {
+			status = append(status, [2]string{"squashfs-backend", toolType})
+		}
 		status = append(status, [2]string{"squashfs-tools", d.getTar2SqfsVersion()})
-		status = append(status, [2]string{"compression", d.options.Compression})
 	}
 
 	return status
@@ -792,11 +815,35 @@ func (d *Driver) runMkfsErofs(tarballPath, dest string) error {
 	// Create EROFS image from tarball with --aufs flag.
 	// The --aufs flag tells mkfs.erofs to convert .wh.* files to overlayfs
 	// whiteout character devices automatically during EROFS creation.
-	cmd := exec.Command("mkfs.erofs", "--tar=i", "--aufs", "-E", "legacy-compress", dest, tarballPath)
+	//
+	// Compression support varies by erofs-utils version:
+	// - 1.7.x: lz4, lz4hc, deflate, libdeflate
+	// - 1.8+:  lz4, lz4hc, deflate, lzma, zstd
+	args := []string{"--tar=i", "--aufs", "-E", "legacy-compress"}
+
+	// Add compression algorithm if specified
+	// Note: If the specified compressor is not available, mkfs.erofs will fail
+	// with a clear error message about unsupported compression algorithm
+	if d.options.Compression != "" {
+		compressor := d.options.Compression
+		// EROFS uses "deflate" while SquashFS uses "gzip"
+		// Map gzip -> deflate for EROFS since they're the same algorithm
+		if compressor == "gzip" {
+			compressor = "deflate"
+		}
+		args = append(args, "-z", compressor)
+	}
+
+	args = append(args, dest, tarballPath)
+	cmd := exec.Command("mkfs.erofs", args...)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 
-	logrus.Debugf("[imagefs] Creating EROFS with aufs whiteout conversion: %v", cmd.Args)
+	compressionInfo := d.options.Compression
+	if compressionInfo == "" {
+		compressionInfo = "none"
+	}
+	logrus.Debugf("[imagefs] Creating EROFS with compression %s: %v", compressionInfo, cmd.Args)
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("mkfs.erofs failed: %w: %s", err, stderr.String())
 	}
@@ -817,29 +864,32 @@ func (d *Driver) runTar2Sqfs(tarballPath, dest string) error {
 	defer tarFile.Close()
 
 	// Detect which tool to use: prefer sqfstar (RHEL 10+), fallback to tar2sqfs (RHEL 9)
-	var cmd *exec.Cmd
-	var cmdName string
+	toolType := d.getSquashfsToolType()
+	if toolType == "" {
+		return fmt.Errorf("neither sqfstar nor tar2sqfs found in PATH")
+	}
 
-	if _, err := exec.LookPath("sqfstar"); err == nil {
+	var cmd *exec.Cmd
+	var args []string
+
+	switch toolType {
+	case "sqfstar":
 		// Use sqfstar (squashfs-tools 4.6.1+ on RHEL 10)
-		cmdName = "sqfstar"
-		args := []string{
-			"-comp", d.options.Compression,
-			dest,
+		if d.options.Compression != "" {
+			args = append(args, "-comp", d.options.Compression)
 		}
+		args = append(args, dest)
 		cmd = exec.Command("sqfstar", args...)
 		logrus.Debugf("[imagefs] Creating squashfs with sqfstar: %v < %s", args, tarballPath)
-	} else if _, err := exec.LookPath("tar2sqfs"); err == nil {
+
+	case "tar2sqfs":
 		// Use tar2sqfs (squashfs-tools-ng on RHEL 9)
-		cmdName = "tar2sqfs"
-		args := []string{
-			"--compressor", d.options.Compression,
-			dest,
+		if d.options.Compression != "" {
+			args = append(args, "--compressor", d.options.Compression)
 		}
+		args = append(args, dest)
 		cmd = exec.Command("tar2sqfs", args...)
 		logrus.Debugf("[imagefs] Creating squashfs with tar2sqfs: %v < %s", args, tarballPath)
-	} else {
-		return fmt.Errorf("neither sqfstar nor tar2sqfs found in PATH")
 	}
 
 	cmd.Stdin = tarFile
@@ -848,7 +898,7 @@ func (d *Driver) runTar2Sqfs(tarballPath, dest string) error {
 	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("%s failed: %w: %s", cmdName, err, stderr.String())
+		return fmt.Errorf("%s failed: %w: %s", toolType, err, stderr.String())
 	}
 
 	return nil

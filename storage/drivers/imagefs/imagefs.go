@@ -9,7 +9,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"slices"
 	"strings"
 
@@ -20,7 +19,6 @@ import (
 	"go.podman.io/storage/pkg/directory"
 	"go.podman.io/storage/pkg/fileutils"
 	"go.podman.io/storage/pkg/idtools"
-	"go.podman.io/storage/pkg/parsers/kernel"
 )
 
 const parentFileName = "parent"
@@ -29,6 +27,7 @@ type Driver struct {
 	home      string
 	runRoot   string
 	options   Options
+	backend   Backend
 	mm        *MountManager
 	syncMode  graphdriver.SyncMode
 	naiveDiff graphdriver.DiffDriver
@@ -40,10 +39,23 @@ func Init(home string, options graphdriver.Options) (graphdriver.Driver, error) 
 		return nil, err
 	}
 
+	// Create the appropriate backend based on the format
+	var backend Backend
+
+	switch opts.Format {
+	case FormatEROFS:
+		backend = NewErofsBackend(opts.Compression)
+	case FormatSquashFS:
+		backend = NewSquashfsBackend(opts.Compression)
+	default:
+		return nil, fmt.Errorf("unsupported format: %s", opts.Format)
+	}
+
 	d := &Driver{
 		home:     home,
 		runRoot:  options.RunRoot,
 		options:  *opts,
+		backend:  backend,
 		mm:       NewMountManager(options.RunRoot, nil),
 		syncMode: graphdriver.SyncModeNone, // Default to no sync
 	}
@@ -204,18 +216,18 @@ func (d *Driver) Get(id string, options graphdriver.MountOpts) (string, error) {
 	// Track whether any layer used FUSE mounts
 	var anyLayerUsedFuse bool
 
-	// Mount parent layers as EROFS lowerdirs.
+	// Mount parent layers as lowerdirs.
 	if len(layers) > 0 {
-		// Determine strategy based on whether all layers are EROFS
-		useMerged, err := d.canUseMergedErofs(layers)
+		// Determine strategy based on whether backend supports merging
+		useMerged, err := d.canUseMergedLayers(layers)
 		if err != nil {
 			return "", err
 		}
 
 		var layersUsedFuse bool
 		if useMerged {
-			logrus.Debugf("[imagefs] Using merged EROFS strategy for container %s", containerID)
-			lowerDirs, layersUsedFuse, err = d.mountErofsMerged(containerID, layers, options.MountLabel)
+			logrus.Debugf("[imagefs] Using merged layers strategy for container %s", containerID)
+			lowerDirs, layersUsedFuse, err = d.mountMergedLayers(containerID, layers, options.MountLabel)
 		} else {
 			logrus.Debugf("[imagefs] Using separate layers strategy for container %s", containerID)
 			lowerDirs, layersUsedFuse, err = d.mountLayersSeparately(containerID, layers, options.MountLabel)
@@ -327,23 +339,19 @@ func (d *Driver) Get(id string, options graphdriver.MountOpts) (string, error) {
 	return mergedDir, nil
 }
 
-func (d *Driver) canUseMergedErofs(layers []string) (bool, error) {
+func (d *Driver) canUseMergedLayers(layers []string) (bool, error) {
+	// Get image paths for all layers
+	imagePaths := make([]string, 0, len(layers))
 	for _, layerID := range layers {
 		path := d.getImagePath(layerID)
-		if !kernel.CheckKernelVersion(5, 14, 0) {
-			return false, nil
-		}
 		if path == "" {
 			return false, fmt.Errorf("no image file found for layer %s", layerID)
 		}
-		if filepath.Ext(path) != ".erofs" {
-			return false, nil // At least one layer is not EROFS
-		}
-		if len(layers) == 1 {
-			return false, nil
-		}
+		imagePaths = append(imagePaths, path)
 	}
-	return true, nil
+
+	// Ask the backend if it can merge these layers
+	return d.backend.CanMergeLayers(imagePaths), nil
 }
 
 // mountFuseOverlay mounts an overlay filesystem using fuse-overlayfs.
@@ -391,7 +399,7 @@ func (d *Driver) mountLayersSeparately(containerID string, layers []string, moun
 	return lowerDirs, usedFuse, nil
 }
 
-func (d *Driver) mountErofsMerged(containerID string, layers []string, mountLabel string) ([]string, bool, error) {
+func (d *Driver) mountMergedLayers(containerID string, layers []string, mountLabel string) ([]string, bool, error) {
 	var imagePaths []string
 	var devicePaths []string
 	for _, layerID := range layers {
@@ -401,7 +409,7 @@ func (d *Driver) mountErofsMerged(containerID string, layers []string, mountLabe
 		}
 		imagePaths = append(imagePaths, path)
 
-		// The device path is the .tar file associated with each image
+		// The device path is the .tar file associated with each image (EROFS-specific)
 		devicePath := path + ".tar"
 		if fileutils.Exists(devicePath) != nil {
 			return nil, false, fmt.Errorf("no tar device file found for layer %s at %s", layerID, devicePath)
@@ -412,22 +420,19 @@ func (d *Driver) mountErofsMerged(containerID string, layers []string, mountLabe
 	rundir := d.mm.GetRundir(containerID)
 	os.MkdirAll(rundir, 0o755)
 
-	mergedImagePath := filepath.Join(rundir, "merged_layers.erofs")
+	mergedImagePath := filepath.Join(rundir, "merged_layers"+d.backend.FileExtension())
 
-	// mkfs.erofs <dest> <src1> <src2> ...
-	args := append([]string{mergedImagePath}, imagePaths...)
-	logrus.Debugf("[imagefs] Creating merged EROFS: mkfs.erofs %v", args)
-	if err := d.mm.mounter.RunCommand("mkfs.erofs", args...); err != nil {
-		return nil, false, fmt.Errorf("failed to merge EROFS layers: %w", err)
+	// Use the backend to merge the layers
+	logrus.Debugf("[imagefs] Merging layers using %s backend", d.backend.Format())
+	if err := d.backend.MergeLayers(imagePaths, devicePaths, mergedImagePath); err != nil {
+		return nil, false, fmt.Errorf("failed to merge layers: %w", err)
 	}
 
-	// When mounting the merged EROFS, we need to pass all the original
-	// device paths so erofsfuse can access the device files (including whiteouts)
-	// that were stored separately in the .tar files
+	// Mount the merged image
 	isRoot := os.Getuid() == 0
 	mountPoint, usedFuse, err := d.mm.MountLayerWithDevices(containerID, "merged-layers", mergedImagePath, isRoot, devicePaths, mountLabel)
 	if err != nil {
-		return nil, false, fmt.Errorf("failed to mount merged EROFS image: %w", err)
+		return nil, false, fmt.Errorf("failed to mount merged image: %w", err)
 	}
 
 	return []string{mountPoint}, usedFuse, nil
@@ -490,15 +495,10 @@ func (d *Driver) getLayerStack(id string) ([]string, error) {
 func (d *Driver) getImagePath(id string) string {
 	// In our updated layout, the image file is stored inside the layer directory:
 	// /home/.../storage/imagefs/<id>/layer.erofs or layer.sqfs
-
-	extensions := []string{".erofs", ".sqfs"}
-	for _, ext := range extensions {
-		img := filepath.Join(d.dir(id), "layer"+ext)
-		if fileutils.Exists(img) == nil {
-			return img
-		}
+	img := filepath.Join(d.dir(id), "layer"+d.backend.FileExtension())
+	if fileutils.Exists(img) == nil {
+		return img
 	}
-
 	return ""
 }
 
@@ -517,94 +517,13 @@ func (d *Driver) ListLayers() ([]string, error) {
 	return nil, fmt.Errorf("ListLayers not implemented")
 }
 
-func (d *Driver) getMkfsErofsVersion() string {
-	cmd := exec.Command("mkfs.erofs", "-V")
-	var stdout bytes.Buffer
-	cmd.Stdout = &stdout
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
 
-	// we don't care about exit codes because we just need to find the version somewhere
-	cmd.Run()
 
-	output := stdout.String()
-	re := regexp.MustCompile(`(\d+\.\d+\.\d+)`)
-	matches := re.FindStringSubmatch(output)
-	if len(matches) > 1 {
-		return matches[1]
-	}
-
-	// Try stderr if stdout doesn't have the version
-	output = stderr.String()
-	matches = re.FindStringSubmatch(output)
-	if len(matches) > 1 {
-		return matches[1]
-	}
-
-	logrus.Debugf("mkfs.erofs output: %s", stdout.String())
-	logrus.Debugf("mkfs.erofs error: %s", stderr.String())
-
-	return "unknown"
-}
-
-// getSquashfsToolType returns which squashfs tool is available on the system.
-// Returns "sqfstar", "tar2sqfs", or "" if neither is found.
-func (d *Driver) getSquashfsToolType() string {
-	if _, err := exec.LookPath("sqfstar"); err == nil {
-		return "sqfstar"
-	}
-	if _, err := exec.LookPath("tar2sqfs"); err == nil {
-		return "tar2sqfs"
-	}
-	return ""
-}
-
-func (d *Driver) getTar2SqfsVersion() string {
-	toolType := d.getSquashfsToolType()
-
-	switch toolType {
-	case "sqfstar":
-		cmd := exec.Command("sqfstar", "-version")
-		var stdout bytes.Buffer
-		var stderr bytes.Buffer
-		cmd.Stdout = &stdout
-		cmd.Stderr = &stderr
-
-		cmd.Run()
-
-		// sqfstar outputs version to stderr
-		output := stdout.String() + stderr.String()
-		re := regexp.MustCompile(`(\d+\.\d+\.\d+)`)
-		matches := re.FindStringSubmatch(output)
-		if len(matches) > 1 {
-			return "sqfstar " + matches[1]
-		}
-		return "sqfstar (unknown version)"
-
-	case "tar2sqfs":
-		cmd := exec.Command("tar2sqfs", "--version")
-		var stdout bytes.Buffer
-		cmd.Stdout = &stdout
-
-		cmd.Run()
-
-		output := stdout.String()
-		re := regexp.MustCompile(`(\d+\.\d+\.\d+)`)
-		matches := re.FindStringSubmatch(output)
-		if len(matches) > 1 {
-			return "tar2sqfs " + matches[1]
-		}
-		return "tar2sqfs (unknown version)"
-
-	default:
-		return "not found"
-	}
-}
 
 func (d *Driver) Status() [][2]string {
 	status := [][2]string{
 		{"driver", "imagefs"},
-		{"format", d.options.Format},
+		{"format", d.backend.Format()},
 	}
 
 	// Show compression if specified
@@ -614,16 +533,8 @@ func (d *Driver) Status() [][2]string {
 	}
 	status = append(status, [2]string{"compression", compression})
 
-	switch d.options.Format {
-	case FormatEROFS:
-		status = append(status, [2]string{"erofs-utils", d.getMkfsErofsVersion()})
-	case FormatSquashFS:
-		toolType := d.getSquashfsToolType()
-		if toolType != "" {
-			status = append(status, [2]string{"squashfs-backend", toolType})
-		}
-		status = append(status, [2]string{"squashfs-tools", d.getTar2SqfsVersion()})
-	}
+	// Add backend-specific status fields
+	status = append(status, d.backend.StatusFields()...)
 
 	return status
 }
@@ -636,15 +547,7 @@ func (d *Driver) Metadata(id string) (map[string]string, error) {
 
 	meta := make(map[string]string)
 	meta["path"] = path
-
-	// Determine the format
-	if filepath.Ext(path) == ".erofs" {
-		meta["format"] = "erofs"
-	} else if filepath.Ext(path) == ".sqfs" {
-		meta["format"] = "squashfs"
-	} else {
-		meta["format"] = "directory"
-	}
+	meta["format"] = d.backend.Format()
 
 	logrus.Debugf("[imagefs] Metadata for layer identified: %v", meta)
 	return meta, nil
@@ -713,21 +616,17 @@ func (d *Driver) Diff(id string, idMappings *idtools.IDMappings, parent string, 
 	imagePath := d.getImagePath(id)
 	isCommittedLayer := imagePath != ""
 
-	// For EROFS committed layers with no parent, return the original tarball.
-	// For squashfs, use naiveDiff - the storage layer handles tar-split reconstruction.
-	if parent == "" && isCommittedLayer && filepath.Ext(imagePath) == ".erofs" {
-		tarballPath := imagePath + ".tar"
-		if fileutils.Exists(tarballPath) == nil {
-			logrus.Debugf("[imagefs] Returning original tarball for EROFS layer %s: %s", id, tarballPath)
-			f, err := os.Open(tarballPath)
-			if err != nil {
-				return nil, fmt.Errorf("failed to open tarball %s: %w", tarballPath, err)
-			}
-			return f, nil
+	// For committed layers with no parent, try to get the diff from the backend
+	if parent == "" && isCommittedLayer {
+		if rc, err := d.backend.GetDiffForBaseLayer(imagePath); err != nil {
+			return nil, err
+		} else if rc != nil {
+			return rc, nil
 		}
+		// If backend returns nil, fall through to naiveDiff
 	}
 
-	// For working container layers (no layer.erofs), tar the upperdir directly.
+	// For working container layers (no layer image), tar the upperdir directly.
 	// This avoids the device/inode mismatch problem when naiveDiff creates
 	// overlay mounts for both the layer and its parent.
 	if !isCommittedLayer {
@@ -756,13 +655,21 @@ func (d *Driver) Changes(id string, idMappings *idtools.IDMappings, parent strin
 
 func (d *Driver) ApplyDiff(id string, options graphdriver.ApplyDiffOpts) (int64, error) {
 	layerDir := d.dir(id)
+	imagePath := filepath.Join(layerDir, "layer"+d.backend.FileExtension())
 
-	if d.options.Format == FormatSquashFS {
-		// SquashFS: Create image directly from stream, don't save tarball
-		// The storage layer handles tar-split separately in imagefs-layers/
-		imagePath := filepath.Join(layerDir, "layer.sqfs")
+	var tarballPath string
+	var size int64
+	var err error
 
-		// Save to temporary file first (needed for sqfstar/tar2sqfs)
+	if d.backend.ShouldPreserveTarball() {
+		// Save the original tarball (EROFS needs this for --device= mounting)
+		tarballPath = imagePath + ".tar"
+		size, err = writeToFile(options.Diff, tarballPath)
+		if err != nil {
+			return 0, fmt.Errorf("failed to save tarball: %w", err)
+		}
+	} else {
+		// Save to temporary file (SquashFS doesn't need persistent tarball)
 		tmpDir := d.GetTempDirRootDirs()[0]
 		td, err := tempdir.NewTempDir(tmpDir)
 		if err != nil {
@@ -775,134 +682,23 @@ func (d *Driver) ApplyDiff(id string, options graphdriver.ApplyDiffOpts) (int64,
 			return 0, fmt.Errorf("failed to stage temp file: %w", err)
 		}
 
-		tmpTarPath := sa.Path
-		size, err := writeToFile(options.Diff, tmpTarPath)
+		tarballPath = sa.Path
+		size, err = writeToFile(options.Diff, tarballPath)
 		if err != nil {
-			return 0, fmt.Errorf("failed to write tar to temp file: %w", err)
+			return 0, fmt.Errorf("failed to write to temp file: %w", err)
 		}
-
-		// Create squashfs from temp tarball
-		if err := d.runTar2Sqfs(tmpTarPath, imagePath); err != nil {
-			return 0, fmt.Errorf("failed to create squashfs image %s: %w", imagePath, err)
-		}
-
-		logrus.Debugf("[imagefs] layer %s: squashfs created, size %d bytes", id, size)
-		return size, nil
-	} else {
-		// EROFS: Save original tarball (needed for --device= mounting)
-		imagePath := filepath.Join(layerDir, "layer.erofs")
-		tarballPath := imagePath + ".tar"
-
-		// Save the original tarball
-		size, err := writeToFile(options.Diff, tarballPath)
-		if err != nil {
-			return 0, fmt.Errorf("failed to save original tarball %s: %w", tarballPath, err)
-		}
-
-		// Create EROFS image directly from the tarball.
-		// The --aufs flag tells mkfs.erofs to automatically convert .wh.* files
-		// to overlayfs whiteout character devices (c 0 0) so deletions work correctly.
-		if err := d.runMkfsErofs(tarballPath, imagePath); err != nil {
-			return 0, fmt.Errorf("failed to create erofs image %s: %w", imagePath, err)
-		}
-
-		logrus.Debugf("[imagefs] layer %s: erofs created, tarball size %d bytes", id, size)
-		return size, nil
 	}
+
+	// Create the filesystem image using the backend
+	if _, err := d.backend.CreateImage(tarballPath, imagePath); err != nil {
+		return 0, fmt.Errorf("failed to create %s image: %w", d.backend.Format(), err)
+	}
+
+	logrus.Debugf("[imagefs] layer %s: %s created, size %d bytes", id, d.backend.Format(), size)
+	return size, nil
 }
 
-func (d *Driver) runMkfsErofs(tarballPath, dest string) error {
-	// Create EROFS image from tarball with --aufs flag.
-	// The --aufs flag tells mkfs.erofs to convert .wh.* files to overlayfs
-	// whiteout character devices automatically during EROFS creation.
-	//
-	// Compression support varies by erofs-utils version:
-	// - 1.7.x: lz4, lz4hc, deflate, libdeflate
-	// - 1.8+:  lz4, lz4hc, deflate, lzma, zstd
-	args := []string{"--tar=i", "--aufs", "-E", "legacy-compress"}
 
-	// Add compression algorithm if specified
-	// Note: If the specified compressor is not available, mkfs.erofs will fail
-	// with a clear error message about unsupported compression algorithm
-	if d.options.Compression != "" {
-		compressor := d.options.Compression
-		// EROFS uses "deflate" while SquashFS uses "gzip"
-		// Map gzip -> deflate for EROFS since they're the same algorithm
-		if compressor == "gzip" {
-			compressor = "deflate"
-		}
-		args = append(args, "-z", compressor)
-	}
-
-	args = append(args, dest, tarballPath)
-	cmd := exec.Command("mkfs.erofs", args...)
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-
-	compressionInfo := d.options.Compression
-	if compressionInfo == "" {
-		compressionInfo = "none"
-	}
-	logrus.Debugf("[imagefs] Creating EROFS with compression %s: %v", compressionInfo, cmd.Args)
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("mkfs.erofs failed: %w: %s", err, stderr.String())
-	}
-
-	return nil
-}
-
-func (d *Driver) runTar2Sqfs(tarballPath, dest string) error {
-	// TODO: Whiteout conversion disabled for testing
-	// Character devices in FUSE-mounted squashfs may not work properly with overlayfs
-	// For now, use the original tarball without conversion
-
-	// Open the original tarball
-	tarFile, err := os.Open(tarballPath)
-	if err != nil {
-		return fmt.Errorf("failed to open tarball: %w", err)
-	}
-	defer tarFile.Close()
-
-	// Detect which tool to use: prefer sqfstar (RHEL 10+), fallback to tar2sqfs (RHEL 9)
-	toolType := d.getSquashfsToolType()
-	if toolType == "" {
-		return fmt.Errorf("neither sqfstar nor tar2sqfs found in PATH")
-	}
-
-	var cmd *exec.Cmd
-	var args []string
-
-	switch toolType {
-	case "sqfstar":
-		// Use sqfstar (squashfs-tools 4.6.1+ on RHEL 10)
-		if d.options.Compression != "" {
-			args = append(args, "-comp", d.options.Compression)
-		}
-		args = append(args, dest)
-		cmd = exec.Command("sqfstar", args...)
-		logrus.Debugf("[imagefs] Creating squashfs with sqfstar: %v < %s", args, tarballPath)
-
-	case "tar2sqfs":
-		// Use tar2sqfs (squashfs-tools-ng on RHEL 9)
-		if d.options.Compression != "" {
-			args = append(args, "--compressor", d.options.Compression)
-		}
-		args = append(args, dest)
-		cmd = exec.Command("tar2sqfs", args...)
-		logrus.Debugf("[imagefs] Creating squashfs with tar2sqfs: %v < %s", args, tarballPath)
-	}
-
-	cmd.Stdin = tarFile
-
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("%s failed: %w: %s", toolType, err, stderr.String())
-	}
-
-	return nil
-}
 
 func writeToFile(r io.Reader, dstPath string) (int64, error) {
 	// Create (or truncate) the destination file with appropriate permissions.
@@ -917,34 +713,6 @@ func writeToFile(r io.Reader, dstPath string) (int64, error) {
 	size, err := io.Copy(f, r)
 	return size, err
 }
-
-// func (d *Driver) runMkfsErofsWithExtraction(r io.Reader, dest string) error {
-// 	// Create a temporary directory for extraction
-// 	rootDir := d.GetTempDirRootDirs()[0]
-// 	td, err := tempdir.NewTempDir(rootDir)
-// 	if err != nil {
-// 		return fmt.Errorf("failed to create temp dir for extraction: %w", err)
-// 	}
-// 	defer td.Cleanup()
-
-// 	// Extract the tarball stream into the temporary directory
-// 	if err := archive.Untar(r, td.Path(), &archive.TarOptions{}); err != nil {
-// 		return fmt.Errorf("failed to extract layer to temp dir: %w", err)
-// 	}
-
-// 	// Run mkfs.erofs on the extracted directory
-// 	// mkfs.erofs <dest_image> <source_dir>
-// 	cmd := exec.Command("mkfs.erofs", dest, td.Path())
-// 	var stderr bytes.Buffer
-// 	cmd.Stderr = &stderr
-
-// 	logrus.Debugf("[imagefs] Creating the layer from directory: %v", cmd.Args)
-// 	if err := cmd.Run(); err != nil {
-// 		return fmt.Errorf("mkfs.erofs failed: %w: %s", err, stderr.String())
-// 	}
-
-// 	return nil
-// }
 
 func (d *Driver) DiffSize(id string, idMappings *idtools.IDMappings, parent string, parentIDMappings *idtools.IDMappings, mountLabel string) (int64, error) {
 	return d.naiveDiff.DiffSize(id, idMappings, parent, parentIDMappings, mountLabel)

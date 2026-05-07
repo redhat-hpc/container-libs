@@ -18,22 +18,24 @@ import (
 
 // ErofsBackend implements the Backend interface for EROFS (Enhanced Read-Only File System).
 type ErofsBackend struct {
+	info        BackendInfo
 	compression string
 }
 
 // NewErofsBackend creates a new EROFS backend.
 func NewErofsBackend(compression string) *ErofsBackend {
 	return &ErofsBackend{
+		info: BackendInfo{
+			Format:          FormatEROFS,
+			FileExtension:   ".erofs",
+			PreserveTarball: true, // EROFS needs tarball for --device= mounting
+		},
 		compression: compression,
 	}
 }
 
-func (b *ErofsBackend) Format() string {
-	return FormatEROFS
-}
-
-func (b *ErofsBackend) FileExtension() string {
-	return ".erofs"
+func (b *ErofsBackend) Info() BackendInfo {
+	return b.info
 }
 
 func (b *ErofsBackend) CreateImage(tarballPath, destImagePath string) (int64, error) {
@@ -82,52 +84,116 @@ func (b *ErofsBackend) CreateImage(tarballPath, destImagePath string) (int64, er
 	return info.Size(), nil
 }
 
-func (b *ErofsBackend) CanMergeLayers(imagePaths []string) bool {
-	// EROFS merge requires:
-	// - Kernel 5.14+ for multi-image support
-	// - At least 2 layers to merge
-	// - All images must be EROFS format
-	if !kernel.CheckKernelVersion(5, 14, 0) {
-		return false
+func (b *ErofsBackend) MountLayers(ctx MountContext) ([]string, bool, error) {
+	if len(ctx.LayerIDs) == 0 {
+		return nil, false, fmt.Errorf("no layers to mount")
 	}
 
-	if len(imagePaths) <= 1 {
-		return false
-	}
+	// Collect image paths and device paths
+	var imagePaths []string
+	var devicePaths []string
+	for _, layerID := range ctx.LayerIDs {
+		imagePath := ctx.GetImagePath(layerID)
+		if imagePath == "" {
+			return nil, false, fmt.Errorf("no image file found for layer %s", layerID)
+		}
+		if filepath.Ext(imagePath) != ".erofs" {
+			return nil, false, fmt.Errorf("layer %s is not an EROFS image", layerID)
+		}
+		imagePaths = append(imagePaths, imagePath)
 
-	for _, path := range imagePaths {
-		if filepath.Ext(path) != ".erofs" {
-			return false
+		// Collect .tar device files for FUSE mounting
+		devicePath := imagePath + ".tar"
+		if fileutils.Exists(devicePath) == nil {
+			devicePaths = append(devicePaths, devicePath)
 		}
 	}
 
-	return true
-}
+	// Check if we can use the merged strategy
+	canMerge := kernel.CheckKernelVersion(5, 14, 0) && len(imagePaths) > 1
 
-func (b *ErofsBackend) MergeLayers(imagePaths []string, devicePaths []string, mergedImagePath string) error {
-	// mkfs.erofs <dest> <src1> <src2> ...
+	if !canMerge {
+		// Fall back to mounting layers separately
+		return b.mountLayersSeparately(ctx, imagePaths)
+	}
+
+	// Use merged strategy
+	logrus.Debugf("[imagefs/erofs] Using merged layers strategy for %d layers", len(imagePaths))
+	rundir := ctx.MountManager.GetRundir(ctx.ContainerID)
+	if err := os.MkdirAll(rundir, 0o755); err != nil {
+		return nil, false, fmt.Errorf("failed to create rundir: %w", err)
+	}
+
+	mergedImagePath := filepath.Join(rundir, "merged_layers.erofs")
+
+	// Create merged EROFS image
 	args := append([]string{mergedImagePath}, imagePaths...)
 	cmd := exec.Command("mkfs.erofs", args...)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 
-	logrus.Debugf("[imagefs] Creating merged EROFS: mkfs.erofs %v", args)
+	logrus.Debugf("[imagefs/erofs] Creating merged EROFS: mkfs.erofs %v", args)
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("mkfs.erofs merge failed: %w: %s", err, stderr.String())
+		return nil, false, fmt.Errorf("mkfs.erofs merge failed: %w: %s", err, stderr.String())
 	}
 
-	return nil
+	// Mount the merged image
+	isRoot := os.Getuid() == 0
+	mountPoint, usedFuse, err := ctx.MountManager.MountLayerWithDevices(
+		ctx.ContainerID,
+		"merged-layers",
+		mergedImagePath,
+		isRoot,
+		devicePaths,
+		ctx.MountLabel,
+	)
+	if err != nil {
+		return nil, false, fmt.Errorf("failed to mount merged image: %w", err)
+	}
+
+	return []string{mountPoint}, usedFuse, nil
 }
 
-func (b *ErofsBackend) ShouldPreserveTarball() bool {
-	return true // EROFS needs the tarball for --device= mounting
+func (b *ErofsBackend) mountLayersSeparately(ctx MountContext, imagePaths []string) ([]string, bool, error) {
+	var lowerDirs []string
+	var usedFuse bool
+
+	for i, imagePath := range imagePaths {
+		layerID := ctx.LayerIDs[i]
+
+		// Get device paths for this specific layer
+		var layerDevicePaths []string
+		devicePath := imagePath + ".tar"
+		if fileutils.Exists(devicePath) == nil {
+			layerDevicePaths = append(layerDevicePaths, devicePath)
+		}
+
+		isRoot := os.Getuid() == 0
+		mountPoint, layerUsedFuse, err := ctx.MountManager.MountLayerWithDevices(
+			ctx.ContainerID,
+			layerID,
+			imagePath,
+			isRoot,
+			layerDevicePaths,
+			ctx.MountLabel,
+		)
+		if err != nil {
+			return nil, false, fmt.Errorf("failed to mount layer %s: %w", layerID, err)
+		}
+		if layerUsedFuse {
+			usedFuse = true
+		}
+		lowerDirs = append(lowerDirs, mountPoint)
+	}
+
+	return lowerDirs, usedFuse, nil
 }
 
-func (b *ErofsBackend) GetDiffForBaseLayer(imagePath string) (io.ReadCloser, error) {
+func (b *ErofsBackend) DiffForBaseLayer(imagePath string) (io.ReadCloser, error) {
 	// For EROFS, return the original tarball to preserve exact digests
 	tarballPath := imagePath + ".tar"
 	if fileutils.Exists(tarballPath) != nil {
-		return nil, nil // Tarball doesn't exist, use naiveDiff
+		return nil, ErrNotSupported // Tarball doesn't exist, use naiveDiff
 	}
 
 	logrus.Debugf("[imagefs] Returning original tarball for EROFS layer: %s", tarballPath)

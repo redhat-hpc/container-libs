@@ -25,13 +25,14 @@ import (
 const parentFileName = "parent"
 
 type Driver struct {
-	home      string
-	runRoot   string
-	options   Options
-	backend   Backend
-	mm        *MountManager
-	syncMode  graphdriver.SyncMode
-	naiveDiff graphdriver.DiffDriver
+	home       string
+	imageStore string // Additional image store directory
+	runRoot    string
+	options    Options
+	backend    Backend
+	mm         *MountManager
+	syncMode   graphdriver.SyncMode
+	naiveDiff  graphdriver.DiffDriver
 
 	// Track active mounts for cleanup
 	activeMountsMu sync.Mutex
@@ -58,6 +59,7 @@ func Init(home string, options graphdriver.Options) (graphdriver.Driver, error) 
 
 	d := &Driver{
 		home:         home,
+		imageStore:   options.ImageStore,
 		runRoot:      options.RunRoot,
 		options:      *opts,
 		backend:      backend,
@@ -88,15 +90,23 @@ func (d *Driver) SyncMode() graphdriver.SyncMode {
 }
 
 func (d *Driver) CreateReadWrite(id, parent string, opts *graphdriver.CreateOpts) error {
-	return d.createLayer(id, parent)
+	// Writable layers always go in the regular home directory
+	return d.createLayer(id, parent, false)
 }
 
 func (d *Driver) Create(id, parent string, opts *graphdriver.CreateOpts) error {
-	return d.createLayer(id, parent)
+	// Read-only image layers go in the image store if configured
+	return d.createLayer(id, parent, true)
 }
 
-func (d *Driver) createLayer(id, parent string) error {
-	dir := d.dir(id)
+func (d *Driver) createLayer(id, parent string, useImageStore bool) error {
+	var dir string
+	if useImageStore {
+		dir = d.dirForImageStore(id)
+	} else {
+		dir = d.dir(id)
+	}
+
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return fmt.Errorf("failed to create directory %s: %w", dir, err)
 	}
@@ -128,7 +138,8 @@ func (d *Driver) CreateFromTemplate(id, template string, templateIDMappings *idt
 	// This avoids copying immutable data while allowing the layer to reference the template.
 	templateImagePath := d.getImagePath(template)
 	if templateImagePath != "" {
-		layerDir := d.dir(id)
+		// New layer goes in image store if configured
+		layerDir := d.dirForImageStore(id)
 		ext := filepath.Ext(templateImagePath)
 
 		// Symlink the EROFS image
@@ -159,14 +170,31 @@ func (d *Driver) Remove(id string) error {
 }
 
 func (d *Driver) DeferredRemove(id string) (tempdir.CleanupTempDirFunc, error) {
-	dir := d.dir(id)
+	// Find the layer in either location
+	var dir string
+	if d.imageStore != "" {
+		imageStoreDir := d.dirForImageStore(id)
+		if fileutils.Exists(imageStoreDir) == nil {
+			dir = imageStoreDir
+		}
+	}
+	if dir == "" {
+		dir = d.dir(id)
+	}
+
 	return func() error {
 		return os.RemoveAll(dir)
 	}, nil
 }
 
 func (d *Driver) GetTempDirRootDirs() []string {
-	return []string{filepath.Join(d.home, "tmp")}
+	tempDirs := []string{filepath.Join(d.home, "tmp")}
+	// Include imageStore temp directory if it's configured
+	// Writable layers can only be in d.home or d.imageStore, not in read-only additional image stores
+	if d.imageStore != "" {
+		tempDirs = append(tempDirs, filepath.Join(d.homeDirForImageStore(), "tmp"))
+	}
+	return tempDirs
 }
 
 func (d *Driver) Get(id string, options graphdriver.MountOpts) (string, error) {
@@ -421,7 +449,19 @@ func (d *Driver) getLayerStack(id string) ([]string, error) {
 	current := id
 	for current != "" {
 		stack = append([]string{current}, stack...)
-		parentFile := filepath.Join(d.dir(current), parentFileName)
+
+		// Try to read parent file from either location
+		var parentFile string
+		if d.imageStore != "" {
+			imageStoreParent := filepath.Join(d.dirForImageStore(current), parentFileName)
+			if fileutils.Exists(imageStoreParent) == nil {
+				parentFile = imageStoreParent
+			}
+		}
+		if parentFile == "" {
+			parentFile = filepath.Join(d.dir(current), parentFileName)
+		}
+
 		data, err := os.ReadFile(parentFile)
 		if err != nil {
 			if os.IsNotExist(err) {
@@ -439,7 +479,18 @@ func (d *Driver) getLayerStack(id string) ([]string, error) {
 func (d *Driver) getImagePath(id string) string {
 	// In our updated layout, the image file is stored inside the layer directory:
 	// /home/.../storage/imagefs/<id>/layer.erofs or layer.sqfs
+	// Check both the image store location and regular home location
 	info := d.backend.Info()
+
+	// Try image store location first (for read-only image layers)
+	if d.imageStore != "" {
+		img := filepath.Join(d.dirForImageStore(id), "layer"+info.FileExtension)
+		if fileutils.Exists(img) == nil {
+			return img
+		}
+	}
+
+	// Try regular home location (for writable layers or when no image store is configured)
 	img := filepath.Join(d.dir(id), "layer"+info.FileExtension)
 	if fileutils.Exists(img) == nil {
 		return img
@@ -455,6 +506,12 @@ func (d *Driver) cleanupMounts(containerID string, mountedDirs []string) {
 }
 
 func (d *Driver) Exists(id string) bool {
+	// Check both image store and regular home locations
+	if d.imageStore != "" {
+		if fileutils.Exists(d.dirForImageStore(id)) == nil {
+			return true
+		}
+	}
 	return fileutils.Exists(d.dir(id)) == nil
 }
 
@@ -565,12 +622,23 @@ func (d *Driver) cleanupOrphanedProcesses() {
 	}
 
 	// Clean up any overlay mounts in home/*/merged
-	if homeEntries, err := os.ReadDir(d.home); err == nil {
-		for _, entry := range homeEntries {
-			if entry.IsDir() {
-				mergedDir := filepath.Join(d.home, entry.Name(), "merged")
-				// Try to unmount - if it's not mounted, this will fail silently
-				exec.Command("fusermount", "-uz", mergedDir).Run()
+	homes := []string{d.home}
+	if d.imageStore != "" {
+		homes = append(homes, d.homeDirForImageStore())
+	}
+	// Also check additional read-only image stores
+	for _, store := range d.options.imageStores {
+		homes = append(homes, filepath.Join(store, "imagefs"))
+	}
+
+	for _, home := range homes {
+		if homeEntries, err := os.ReadDir(home); err == nil {
+			for _, entry := range homeEntries {
+				if entry.IsDir() {
+					mergedDir := filepath.Join(home, entry.Name(), "merged")
+					// Try to unmount - if it's not mounted, this will fail silently
+					exec.Command("fusermount", "-uz", mergedDir).Run()
+				}
 			}
 		}
 	}
@@ -579,7 +647,7 @@ func (d *Driver) cleanupOrphanedProcesses() {
 }
 
 func (d *Driver) AdditionalImageStores() []string {
-	return nil
+	return d.options.imageStores
 }
 
 func (d *Driver) Dedup(args graphdriver.DedupArgs) (graphdriver.DedupResult, error) {
@@ -609,7 +677,19 @@ func (d *Driver) Diff(id string, idMappings *idtools.IDMappings, parent string, 
 	// This avoids the device/inode mismatch problem when naiveDiff creates
 	// overlay mounts for both the layer and its parent.
 	if !isCommittedLayer {
-		upperdir := filepath.Join(d.dir(id), "upper")
+		// Find the layer directory (should be in regular home for writable layers)
+		var layerDir string
+		if d.imageStore != "" {
+			imageStoreDir := d.dirForImageStore(id)
+			if fileutils.Exists(imageStoreDir) == nil {
+				layerDir = imageStoreDir
+			}
+		}
+		if layerDir == "" {
+			layerDir = d.dir(id)
+		}
+
+		upperdir := filepath.Join(layerDir, "upper")
 		logrus.Debugf("[imagefs] Tarring upperdir for working layer %s: %s", id, upperdir)
 
 		if idMappings == nil {
@@ -634,7 +714,19 @@ func (d *Driver) Changes(id string, idMappings *idtools.IDMappings, parent strin
 
 func (d *Driver) ApplyDiff(id string, options graphdriver.ApplyDiffOpts) (int64, error) {
 	info := d.backend.Info()
-	layerDir := d.dir(id)
+
+	// Find the correct layer directory (could be in image store or regular home)
+	var layerDir string
+	if d.imageStore != "" {
+		imageStoreDir := d.dirForImageStore(id)
+		if fileutils.Exists(imageStoreDir) == nil {
+			layerDir = imageStoreDir
+		}
+	}
+	if layerDir == "" {
+		layerDir = d.dir(id)
+	}
+
 	imagePath := filepath.Join(layerDir, "layer"+info.FileExtension)
 
 	var tarballPath string
@@ -725,6 +817,51 @@ func (d *Driver) SupportsShifting(uidmap, gidmap []idtools.IDMap) bool {
 
 func (d *Driver) dir(id string) string {
 	return filepath.Join(d.home, id)
+}
+
+// homeDirForImageStore returns the home directory to use when an image store is configured.
+// This is used for read-only image layers.
+func (d *Driver) homeDirForImageStore() string {
+	if d.imageStore != "" {
+		return filepath.Join(d.imageStore, "imagefs")
+	}
+	// If there is not an image store configured, use the same store
+	return d.home
+}
+
+// dirForImageStore returns the directory for a layer that should be in the image store.
+// It checks the writable image store, then additional read-only stores, then the regular home location.
+func (d *Driver) dirForImageStore(id string) string {
+	// First check the writable image store (if configured)
+	if d.imageStore != "" {
+		homedir := d.homeDirForImageStore()
+		newpath := filepath.Join(homedir, id)
+		if fileutils.Exists(newpath) == nil {
+			return newpath
+		}
+	}
+
+	// Then check additional read-only image stores
+	for _, store := range d.options.imageStores {
+		storePath := filepath.Join(store, "imagefs", id)
+		if fileutils.Exists(storePath) == nil {
+			return storePath
+		}
+	}
+
+	// Finally check the regular home location (for migration/compatibility)
+	regularPath := filepath.Join(d.home, id)
+	if fileutils.Exists(regularPath) == nil {
+		return regularPath
+	}
+
+	// Default to writable image store location for new layers (if configured)
+	if d.imageStore != "" {
+		return filepath.Join(d.homeDirForImageStore(), id)
+	}
+
+	// Otherwise default to regular home
+	return regularPath
 }
 
 func (d *Driver) relabel(path string) {

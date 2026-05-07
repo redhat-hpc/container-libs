@@ -3,40 +3,63 @@
 package imagefs
 
 import (
+	"errors"
 	"io"
 )
 
+// ErrNotSupported indicates an operation is not supported by this backend.
+var ErrNotSupported = errors.New("operation not supported by this backend")
+
+// BackendInfo contains static properties of a backend.
+type BackendInfo struct {
+	// Format is the name of the filesystem format ("erofs" or "squashfs")
+	Format string
+
+	// FileExtension is the file extension for this format (".erofs" or ".sqfs")
+	FileExtension string
+
+	// PreserveTarball indicates whether to keep the original tarball for tar-split.
+	// EROFS: true (needs .tar for --device= mounting)
+	// SquashFS: false (storage layer handles tar-split)
+	PreserveTarball bool
+}
+
+// MountContext provides the context needed for backends to mount layers.
+type MountContext struct {
+	// LayerIDs is the list of layer IDs to mount (in bottom-to-top order)
+	LayerIDs []string
+
+	// ContainerID is the container using these layers
+	ContainerID string
+
+	// MountLabel is the SELinux mount label
+	MountLabel string
+
+	// MountManager handles the actual mounting operations
+	MountManager *MountManager
+
+	// GetImagePath returns the image file path for a given layer ID
+	GetImagePath func(id string) string
+}
+
 // Backend handles format-specific operations for creating and managing filesystem images.
 type Backend interface {
-	// Format returns the format name ("erofs" or "squashfs")
-	Format() string
-
-	// FileExtension returns the file extension for this format (".erofs" or ".sqfs")
-	FileExtension() string
+	// Info returns static backend properties.
+	Info() BackendInfo
 
 	// CreateImage creates a filesystem image from a tarball.
 	// Returns the size of the original tarball in bytes.
 	CreateImage(tarballPath, destImagePath string) (int64, error)
 
-	// CanMergeLayers returns true if this backend supports merging multiple
-	// image files into a single merged image (EROFS-specific optimization).
-	CanMergeLayers(imagePaths []string) bool
+	// MountLayers mounts layers using backend-specific optimizations.
+	// Returns mount points (in bottom-to-top order), whether FUSE was used, and error.
+	// Returns ErrNotSupported if backend doesn't support optimized mounting.
+	MountLayers(ctx MountContext) ([]string, bool, error)
 
-	// MergeLayers merges multiple image files into a single image.
-	// Returns an error if merging is not supported by this backend.
-	// Only called if CanMergeLayers returns true.
-	MergeLayers(imagePaths []string, devicePaths []string, mergedImagePath string) error
-
-	// ShouldPreserveTarball returns true if this backend needs to keep
-	// the original tarball for tar-split reconstruction.
-	// EROFS: true (needs .tar for --device= mounting)
-	// SquashFS: false (storage layer handles tar-split)
-	ShouldPreserveTarball() bool
-
-	// GetDiffForBaseLayer returns a ReadCloser for the layer's diff.
+	// DiffForBaseLayer returns a ReadCloser for the layer's diff.
 	// For EROFS, this returns the original tarball to preserve digests.
-	// For SquashFS, returns nil to indicate naiveDiff should be used.
-	GetDiffForBaseLayer(imagePath string) (io.ReadCloser, error)
+	// For SquashFS, returns ErrNotSupported to indicate naiveDiff should be used.
+	DiffForBaseLayer(imagePath string) (io.ReadCloser, error)
 
 	// StatusFields returns format-specific status information as key-value pairs.
 	// Examples:

@@ -24,7 +24,6 @@ import (
 
 const parentFileName = "parent"
 
-
 type Driver struct {
 	home      string
 	runRoot   string
@@ -235,21 +234,16 @@ func (d *Driver) Get(id string, options graphdriver.MountOpts) (string, error) {
 
 	// Mount parent layers as lowerdirs.
 	if len(layers) > 0 {
-		// Determine strategy based on whether backend supports merging
-		useMerged, err := d.canUseMergedLayers(layers)
-		if err != nil {
-			return "", err
+		// Backend handles all mounting logic (with optimizations like EROFS merge if available)
+		ctx := MountContext{
+			LayerIDs:     layers,
+			ContainerID:  containerID,
+			MountLabel:   options.MountLabel,
+			MountManager: d.mm,
+			GetImagePath: d.getImagePath,
 		}
-
 		var layersUsedFuse bool
-		if useMerged {
-			logrus.Debugf("[imagefs] Using merged layers strategy for container %s", containerID)
-			lowerDirs, layersUsedFuse, err = d.mountMergedLayers(containerID, layers, options.MountLabel)
-		} else {
-			logrus.Debugf("[imagefs] Using separate layers strategy for container %s", containerID)
-			lowerDirs, layersUsedFuse, err = d.mountLayersSeparately(containerID, layers, options.MountLabel)
-		}
-
+		lowerDirs, layersUsedFuse, err = d.backend.MountLayers(ctx)
 		if err != nil {
 			return "", err
 		}
@@ -259,12 +253,9 @@ func (d *Driver) Get(id string, options graphdriver.MountOpts) (string, error) {
 		}
 
 		// Lowerdir for OverlayFS is top-to-bottom (most recent first)
-		// If we used separate mounts, they were mounted bottom-to-top, so we reverse.
-		// If we used merged, there is only one mount point, so reverse does nothing.
-		if !useMerged {
-			for i, j := 0, len(lowerDirs)-1; i < j; i, j = i+1, j-1 {
-				lowerDirs[i], lowerDirs[j] = lowerDirs[j], lowerDirs[i]
-			}
+		// Backend returns bottom-to-top, so reverse for overlay
+		for i, j := 0, len(lowerDirs)-1; i < j; i, j = i+1, j-1 {
+			lowerDirs[i], lowerDirs[j] = lowerDirs[j], lowerDirs[i]
 		}
 	}
 
@@ -362,21 +353,6 @@ func (d *Driver) Get(id string, options graphdriver.MountOpts) (string, error) {
 	return mergedDir, nil
 }
 
-func (d *Driver) canUseMergedLayers(layers []string) (bool, error) {
-	// Get image paths for all layers
-	imagePaths := make([]string, 0, len(layers))
-	for _, layerID := range layers {
-		path := d.getImagePath(layerID)
-		if path == "" {
-			return false, fmt.Errorf("no image file found for layer %s", layerID)
-		}
-		imagePaths = append(imagePaths, path)
-	}
-
-	// Ask the backend if it can merge these layers
-	return d.backend.CanMergeLayers(imagePaths), nil
-}
-
 // mountFuseOverlay mounts an overlay filesystem using fuse-overlayfs.
 func mountFuseOverlay(lowerdir, upperdir, workdir, target string) error {
 	opts := fmt.Sprintf("lowerdir=%s,upperdir=%s,workdir=%s", lowerdir, upperdir, workdir)
@@ -390,77 +366,6 @@ func mountFuseOverlay(lowerdir, upperdir, workdir, target string) error {
 	logrus.Debugf("[imagefs] fuse-overlayfs mount successful: %s", target)
 	return nil
 }
-
-func (d *Driver) mountLayersSeparately(containerID string, layers []string, mountLabel string) ([]string, bool, error) {
-	var lowerDirs []string
-	var usedFuse bool
-	for _, layerID := range layers {
-		imagePath := d.getImagePath(layerID)
-		if imagePath == "" {
-			return nil, false, fmt.Errorf("no image file found for layer %s", layerID)
-		}
-
-		// For EROFS layers, we also need the .tar device file
-		var devicePaths []string
-		if filepath.Ext(imagePath) == ".erofs" {
-			devicePath := imagePath + ".tar"
-			if fileutils.Exists(devicePath) == nil {
-				devicePaths = append(devicePaths, devicePath)
-			}
-		}
-
-		isRoot := os.Getuid() == 0
-		mountPoint, layerUsedFuse, err := d.mm.MountLayerWithDevices(containerID, layerID, imagePath, isRoot, devicePaths, mountLabel)
-		if err != nil {
-			return nil, false, fmt.Errorf("failed to mount layer %s: %w", layerID, err)
-		}
-		if layerUsedFuse {
-			usedFuse = true
-		}
-		lowerDirs = append(lowerDirs, mountPoint)
-	}
-	return lowerDirs, usedFuse, nil
-}
-
-func (d *Driver) mountMergedLayers(containerID string, layers []string, mountLabel string) ([]string, bool, error) {
-	var imagePaths []string
-	var devicePaths []string
-	for _, layerID := range layers {
-		path := d.getImagePath(layerID)
-		if path == "" {
-			return nil, false, fmt.Errorf("no image file found for layer %s", layerID)
-		}
-		imagePaths = append(imagePaths, path)
-
-		// The device path is the .tar file associated with each image (EROFS-specific)
-		devicePath := path + ".tar"
-		if fileutils.Exists(devicePath) != nil {
-			return nil, false, fmt.Errorf("no tar device file found for layer %s at %s", layerID, devicePath)
-		}
-		devicePaths = append(devicePaths, devicePath)
-	}
-
-	rundir := d.mm.GetRundir(containerID)
-	os.MkdirAll(rundir, 0o755)
-
-	mergedImagePath := filepath.Join(rundir, "merged_layers"+d.backend.FileExtension())
-
-	// Use the backend to merge the layers
-	logrus.Debugf("[imagefs] Merging layers using %s backend", d.backend.Format())
-	if err := d.backend.MergeLayers(imagePaths, devicePaths, mergedImagePath); err != nil {
-		return nil, false, fmt.Errorf("failed to merge layers: %w", err)
-	}
-
-	// Mount the merged image
-	isRoot := os.Getuid() == 0
-	mountPoint, usedFuse, err := d.mm.MountLayerWithDevices(containerID, "merged-layers", mergedImagePath, isRoot, devicePaths, mountLabel)
-	if err != nil {
-		return nil, false, fmt.Errorf("failed to mount merged image: %w", err)
-	}
-
-	return []string{mountPoint}, usedFuse, nil
-}
-
 func (d *Driver) Put(id string) error {
 	// Unmount merged dir (only if it exists - read-only mounts don't create it)
 	mergedDir := filepath.Join(d.dir(id), "merged")
@@ -534,7 +439,8 @@ func (d *Driver) getLayerStack(id string) ([]string, error) {
 func (d *Driver) getImagePath(id string) string {
 	// In our updated layout, the image file is stored inside the layer directory:
 	// /home/.../storage/imagefs/<id>/layer.erofs or layer.sqfs
-	img := filepath.Join(d.dir(id), "layer"+d.backend.FileExtension())
+	info := d.backend.Info()
+	img := filepath.Join(d.dir(id), "layer"+info.FileExtension)
 	if fileutils.Exists(img) == nil {
 		return img
 	}
@@ -556,13 +462,11 @@ func (d *Driver) ListLayers() ([]string, error) {
 	return nil, fmt.Errorf("ListLayers not implemented")
 }
 
-
-
-
 func (d *Driver) Status() [][2]string {
+	info := d.backend.Info()
 	status := [][2]string{
 		{"driver", "imagefs"},
-		{"format", d.backend.Format()},
+		{"format", info.Format},
 	}
 
 	// Show compression if specified
@@ -584,9 +488,10 @@ func (d *Driver) Metadata(id string) (map[string]string, error) {
 		return nil, fmt.Errorf("no image or directory found for layer %s", id)
 	}
 
+	info := d.backend.Info()
 	meta := make(map[string]string)
 	meta["path"] = path
-	meta["format"] = d.backend.Format()
+	meta["format"] = info.Format
 
 	logrus.Debugf("[imagefs] Metadata for layer identified: %v", meta)
 	return meta, nil
@@ -690,12 +595,14 @@ func (d *Driver) Diff(id string, idMappings *idtools.IDMappings, parent string, 
 
 	// For committed layers with no parent, try to get the diff from the backend
 	if parent == "" && isCommittedLayer {
-		if rc, err := d.backend.GetDiffForBaseLayer(imagePath); err != nil {
-			return nil, err
-		} else if rc != nil {
+		rc, err := d.backend.DiffForBaseLayer(imagePath)
+		if err == nil {
 			return rc, nil
 		}
-		// If backend returns nil, fall through to naiveDiff
+		// If backend returns ErrNotSupported, fall through to other methods
+		if err != ErrNotSupported {
+			return nil, err
+		}
 	}
 
 	// For working container layers (no layer image), tar the upperdir directly.
@@ -726,14 +633,15 @@ func (d *Driver) Changes(id string, idMappings *idtools.IDMappings, parent strin
 }
 
 func (d *Driver) ApplyDiff(id string, options graphdriver.ApplyDiffOpts) (int64, error) {
+	info := d.backend.Info()
 	layerDir := d.dir(id)
-	imagePath := filepath.Join(layerDir, "layer"+d.backend.FileExtension())
+	imagePath := filepath.Join(layerDir, "layer"+info.FileExtension)
 
 	var tarballPath string
 	var size int64
 	var err error
 
-	if d.backend.ShouldPreserveTarball() {
+	if info.PreserveTarball {
 		// Save the original tarball (EROFS needs this for --device= mounting)
 		tarballPath = imagePath + ".tar"
 		size, err = writeToFile(options.Diff, tarballPath)
@@ -763,7 +671,7 @@ func (d *Driver) ApplyDiff(id string, options graphdriver.ApplyDiffOpts) (int64,
 
 	// Create the filesystem image using the backend
 	if _, err := d.backend.CreateImage(tarballPath, imagePath); err != nil {
-		return 0, fmt.Errorf("failed to create %s image: %w", d.backend.Format(), err)
+		return 0, fmt.Errorf("failed to create %s image: %w", info.Format, err)
 	}
 
 	// Clean up upperdir and workdir since this layer is now committed.
@@ -781,11 +689,9 @@ func (d *Driver) ApplyDiff(id string, options graphdriver.ApplyDiffOpts) (int64,
 		}
 	}
 
-	logrus.Debugf("[imagefs] layer %s: %s created, size %d bytes", id, d.backend.Format(), size)
+	logrus.Debugf("[imagefs] layer %s: %s created, size %d bytes", id, info.Format, size)
 	return size, nil
 }
-
-
 
 func writeToFile(r io.Reader, dstPath string) (int64, error) {
 	// Create (or truncate) the destination file with appropriate permissions.

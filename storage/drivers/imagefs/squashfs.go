@@ -15,22 +15,24 @@ import (
 
 // SquashfsBackend implements the Backend interface for SquashFS.
 type SquashfsBackend struct {
+	info        BackendInfo
 	compression string
 }
 
 // NewSquashfsBackend creates a new SquashFS backend.
 func NewSquashfsBackend(compression string) *SquashfsBackend {
 	return &SquashfsBackend{
+		info: BackendInfo{
+			Format:          FormatSquashFS,
+			FileExtension:   ".sqfs",
+			PreserveTarball: false, // Storage layer handles tar-split
+		},
 		compression: compression,
 	}
 }
 
-func (b *SquashfsBackend) Format() string {
-	return FormatSquashFS
-}
-
-func (b *SquashfsBackend) FileExtension() string {
-	return ".sqfs"
+func (b *SquashfsBackend) Info() BackendInfo {
+	return b.info
 }
 
 func (b *SquashfsBackend) CreateImage(tarballPath, destImagePath string) (int64, error) {
@@ -89,20 +91,41 @@ func (b *SquashfsBackend) CreateImage(tarballPath, destImagePath string) (int64,
 	return size, nil
 }
 
-func (b *SquashfsBackend) CanMergeLayers(imagePaths []string) bool {
-	return false // SquashFS doesn't support merging
+func (b *SquashfsBackend) MountLayers(ctx MountContext) ([]string, bool, error) {
+	// SquashFS doesn't have optimizations like EROFS merge, so just mount each layer separately
+	var lowerDirs []string
+	var usedFuse bool
+
+	for _, layerID := range ctx.LayerIDs {
+		imagePath := ctx.GetImagePath(layerID)
+		if imagePath == "" {
+			return nil, false, fmt.Errorf("no image file found for layer %s", layerID)
+		}
+
+		// SquashFS doesn't need device paths like EROFS
+		isRoot := os.Getuid() == 0
+		mountPoint, layerUsedFuse, err := ctx.MountManager.MountLayerWithDevices(
+			ctx.ContainerID,
+			layerID,
+			imagePath,
+			isRoot,
+			nil, // no device paths for SquashFS
+			ctx.MountLabel,
+		)
+		if err != nil {
+			return nil, false, fmt.Errorf("failed to mount layer %s: %w", layerID, err)
+		}
+		if layerUsedFuse {
+			usedFuse = true
+		}
+		lowerDirs = append(lowerDirs, mountPoint)
+	}
+
+	return lowerDirs, usedFuse, nil
 }
 
-func (b *SquashfsBackend) MergeLayers(imagePaths []string, devicePaths []string, mergedImagePath string) error {
-	return fmt.Errorf("squashfs backend does not support layer merging")
-}
-
-func (b *SquashfsBackend) ShouldPreserveTarball() bool {
-	return false // SquashFS doesn't need the tarball, storage handles tar-split
-}
-
-func (b *SquashfsBackend) GetDiffForBaseLayer(imagePath string) (io.ReadCloser, error) {
-	return nil, nil // Signal to use naiveDiff
+func (b *SquashfsBackend) DiffForBaseLayer(imagePath string) (io.ReadCloser, error) {
+	return nil, ErrNotSupported // Signal to use naiveDiff
 }
 
 func (b *SquashfsBackend) StatusFields() [][2]string {

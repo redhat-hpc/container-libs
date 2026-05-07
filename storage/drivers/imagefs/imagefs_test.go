@@ -39,32 +39,24 @@ type RunCommandCall struct {
 // MockBackend is a simple mock implementation of the Backend interface for testing
 type MockBackend struct{}
 
-func (m *MockBackend) Format() string {
-	return "erofs"
-}
-
-func (m *MockBackend) FileExtension() string {
-	return ".erofs"
+func (m *MockBackend) Info() BackendInfo {
+	return BackendInfo{
+		Format:          "erofs",
+		FileExtension:   ".erofs",
+		PreserveTarball: true,
+	}
 }
 
 func (m *MockBackend) CreateImage(tarballPath, destImagePath string) (int64, error) {
 	return 0, nil
 }
 
-func (m *MockBackend) CanMergeLayers(imagePaths []string) bool {
-	return true
+func (m *MockBackend) MountLayers(ctx MountContext) ([]string, bool, error) {
+	return nil, false, ErrNotSupported
 }
 
-func (m *MockBackend) MergeLayers(imagePaths []string, devicePaths []string, mergedImagePath string) error {
-	return nil
-}
-
-func (m *MockBackend) ShouldPreserveTarball() bool {
-	return true
-}
-
-func (m *MockBackend) GetDiffForBaseLayer(imagePath string) (io.ReadCloser, error) {
-	return nil, nil
+func (m *MockBackend) DiffForBaseLayer(imagePath string) (io.ReadCloser, error) {
+	return nil, ErrNotSupported
 }
 
 func (m *MockBackend) StatusFields() [][2]string {

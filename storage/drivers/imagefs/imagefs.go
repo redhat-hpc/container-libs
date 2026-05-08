@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/opencontainers/selinux/go-selinux/label"
 	"github.com/sirupsen/logrus"
 	graphdriver "go.podman.io/storage/drivers"
 	"go.podman.io/storage/internal/tempdir"
@@ -110,8 +111,6 @@ func (d *Driver) createLayer(id, parent string, useImageStore bool) error {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return fmt.Errorf("failed to create directory %s: %w", dir, err)
 	}
-
-	d.relabel(dir)
 
 	if parent != "" {
 		if err := os.WriteFile(filepath.Join(dir, parentFileName), []byte(parent), 0644); err != nil {
@@ -350,10 +349,11 @@ func (d *Driver) Get(id string, options graphdriver.MountOpts) (string, error) {
 			return "", fmt.Errorf("fuse-overlayfs is required when layers are FUSE-mounted but not found in PATH")
 		}
 		logrus.Debugf("[imagefs] Using fuse-overlayfs for container %s (FUSE lowerdirs detected)", containerID)
-		err = mountFuseOverlay(lowerdirString, upperdir, workdir, mergedDir)
+		err = mountFuseOverlay(lowerdirString, upperdir, workdir, mergedDir, options.MountLabel)
 	} else {
 		// All layers are kernel-mounted, use kernel overlayfs
 		opts := fmt.Sprintf("lowerdir=%s,upperdir=%s,workdir=%s", lowerdirString, upperdir, workdir)
+		opts = label.FormatMountLabel(opts, options.MountLabel)
 		logrus.Debugf("[imagefs] Using kernel overlayfs for container %s with options: %s", containerID, opts)
 		err = mountOverlayFrom(d.home, "overlay", mergedDir, "overlay", 0, opts)
 	}
@@ -382,8 +382,9 @@ func (d *Driver) Get(id string, options graphdriver.MountOpts) (string, error) {
 }
 
 // mountFuseOverlay mounts an overlay filesystem using fuse-overlayfs.
-func mountFuseOverlay(lowerdir, upperdir, workdir, target string) error {
+func mountFuseOverlay(lowerdir, upperdir, workdir, target, mountLabel string) error {
 	opts := fmt.Sprintf("lowerdir=%s,upperdir=%s,workdir=%s", lowerdir, upperdir, workdir)
+	opts = label.FormatMountLabel(opts, mountLabel)
 	logrus.Debugf("[imagefs] Mounting overlay with fuse-overlayfs: target=%s, options=%s", target, opts)
 	cmd := exec.Command("fuse-overlayfs", "-o", opts, target)
 	var stderr bytes.Buffer
@@ -862,11 +863,4 @@ func (d *Driver) dirForImageStore(id string) string {
 
 	// Otherwise default to regular home
 	return regularPath
-}
-
-func (d *Driver) relabel(path string) {
-	// Attempt to relabel the path to container_file_t for SELinux.
-	// This is necessary for rootless containers to access files in the home directory.
-	// We ignore errors here because chcon might not be installed or SELinux might be disabled.
-	_ = exec.Command("chcon", "-t", "container_file_t", path).Run()
 }

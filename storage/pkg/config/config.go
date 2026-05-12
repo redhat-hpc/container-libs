@@ -54,6 +54,13 @@ type ZfsOptionsConfig struct {
 	Size string `toml:"size,omitempty"`
 }
 
+type ImagefsOptionsConfig struct {
+	// Format specifies the filesystem format (erofs or squashfs)
+	Format string `toml:"imagefs_format,omitempty"`
+	// Compression specifies the compression algorithm
+	Compression string `toml:"imagefs_compression,omitempty"`
+}
+
 // OptionsConfig represents the "storage.options" TOML config table.
 type OptionsConfig struct {
 	// AdditionalImagesStores is the location of additional read/only
@@ -110,6 +117,9 @@ type OptionsConfig struct {
 
 	// Zfs container options to be handed to ZFS drivers
 	Zfs struct{ ZfsOptionsConfig } `toml:"zfs,omitempty"`
+
+	// Imagefs container options to be handed to imagefs drivers
+	Imagefs struct{ ImagefsOptionsConfig } `toml:"imagefs,omitempty"`
 
 	// Do not create a bind mount on the storage home
 	SkipMountHome string `toml:"skip_mount_home,omitempty"`
@@ -182,6 +192,13 @@ func GetGraphDriverOptions(options OptionsConfig) []string {
 	}
 	if options.Zfs.Size != "" {
 		doptions = append(doptions, fmt.Sprintf("zfs.size=%s", options.Zfs.Size))
+	}
+
+	if options.Imagefs.Format != "" {
+		doptions = append(doptions, fmt.Sprintf("imagefs_format=%s", options.Imagefs.Format))
+	}
+	if options.Imagefs.Compression != "" {
+		doptions = append(doptions, fmt.Sprintf("imagefs_compression=%s", options.Imagefs.Compression))
 	}
 
 	return doptions

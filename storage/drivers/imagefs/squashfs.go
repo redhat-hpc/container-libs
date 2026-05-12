@@ -91,6 +91,15 @@ func (b *SquashfsBackend) CreateImage(tarballPath, destImagePath string) (int64,
 	return size, nil
 }
 
+func (b *SquashfsBackend) CreateMountSpec(imagePath string) MountSpec {
+	return MountSpec{
+		ImagePath:   imagePath,
+		FsType:      "squashfs",
+		FuseCommand: "squashfuse",
+		// SquashFS doesn't need device paths or special kernel flags
+	}
+}
+
 func (b *SquashfsBackend) MountLayers(ctx MountContext) ([]string, bool, error) {
 	// SquashFS doesn't have optimizations like EROFS merge, so just mount each layer separately
 	var lowerDirs []string
@@ -102,14 +111,13 @@ func (b *SquashfsBackend) MountLayers(ctx MountContext) ([]string, bool, error) 
 			return nil, false, fmt.Errorf("no image file found for layer %s", layerID)
 		}
 
-		// SquashFS doesn't need device paths like EROFS
+		spec := b.CreateMountSpec(imagePath)
 		isRoot := os.Getuid() == 0
-		mountPoint, layerUsedFuse, err := ctx.MountManager.MountLayerWithDevices(
+		mountPoint, layerUsedFuse, err := ctx.MountManager.MountLayer(
 			ctx.ContainerID,
 			layerID,
-			imagePath,
+			spec,
 			isRoot,
-			nil, // no device paths for SquashFS
 			ctx.MountLabel,
 		)
 		if err != nil {

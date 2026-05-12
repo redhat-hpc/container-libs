@@ -60,6 +60,38 @@ Uses modern syscalls for kernel mounts:
 
 For images with 50+ layers, uses reexec subprocess with `/proc/self/fd` file descriptors to shorten mount option strings and avoid kernel page size limits.
 
+## Backend Architecture
+
+The driver uses a clean backend abstraction to separate format-specific logic from generic infrastructure:
+
+**Backend Interface:**
+- `Info()` - Static properties (format name, file extension, tarball preservation)
+- `CreateImage()` - Format-specific image creation
+- `CreateMountSpec()` - Returns MountSpec with all format-specific details
+- `MountLayers()` - Implements format-specific optimizations (e.g., EROFS merge)
+- `DiffForBaseLayer()` - Format-specific diff export
+
+**MountSpec:** Describes how to mount an image with all format-specific details (filesystem type, device paths, FUSE command, kernel flags). This keeps MountManager completely generic.
+
+**EROFS Backend:**
+- Saves original `.tar` tarball for device mounting
+- Uses `mkfs.erofs --aufs` for automatic whiteout conversion
+- Mount spec includes device path and `noacl` kernel flag
+- **Merge optimization (kernel 5.14+):** Combines multiple EROFS images into one metadata-only image. Requires all original `.tar` device files for mounting.
+- Falls back to separate mounts on older kernels
+
+**SquashFS Backend:**
+- No tarball preservation (storage handles tar-split)
+- Uses `sqfstar` or `tar2sqfs` for creation
+- Simple mount spec without device paths or special flags
+- No merge optimization - each layer mounted separately
+
+**MountManager (Generic):**
+- All format-specific details come from MountSpec
+- Handles kernel vs FUSE fallback
+- No file extension checks or format detection
+- Easy to add new formats by implementing Backend interface
+
 ## Layer Types
 
 **Committed Layers** (have `layer.erofs` or `layer.sqfs`):

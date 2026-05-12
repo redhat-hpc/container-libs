@@ -228,15 +228,9 @@ func (d *Driver) Get(id string, options graphdriver.MountOpts) (string, error) {
 	// the layer directly without overlay. This is important for tar-split
 	// reconstruction which needs to read the exact original layer content.
 	if isReadOnly && isCommittedLayer {
-		var devicePaths []string
-		if filepath.Ext(idImagePath) == ".erofs" {
-			devicePath := idImagePath + ".tar"
-			if fileutils.Exists(devicePath) == nil {
-				devicePaths = append(devicePaths, devicePath)
-			}
-		}
+		spec := d.createMountSpec(idImagePath)
 		isRoot := os.Getuid() == 0
-		mountPoint, _, err := d.mm.MountLayerWithDevices(containerID, id, idImagePath, isRoot, devicePaths, options.MountLabel)
+		mountPoint, _, err := d.mm.MountLayer(containerID, id, spec, isRoot, options.MountLabel)
 		if err != nil {
 			return "", fmt.Errorf("failed to mount layer %s read-only: %w", id, err)
 		}
@@ -286,21 +280,14 @@ func (d *Driver) Get(id string, options graphdriver.MountOpts) (string, error) {
 		}
 	}
 
-	// If the requested layer is a committed image layer, mount its own EROFS
-	// image and prepend it as the topmost lowerdir. This ensures that files
+	// If the requested layer is a committed image layer, mount its own image
+	// and prepend it as the topmost lowerdir. This ensures that files
 	// added or deleted (via whiteout devices) by this layer are visible in
 	// the overlay merged view.
 	if isCommittedLayer {
-		var devicePaths []string
-		if filepath.Ext(idImagePath) == ".erofs" {
-			devicePath := idImagePath + ".tar"
-			if fileutils.Exists(devicePath) == nil {
-				devicePaths = append(devicePaths, devicePath)
-			}
-		}
-
+		spec := d.createMountSpec(idImagePath)
 		isRoot := os.Getuid() == 0
-		mountPoint, layerUsedFuse, err := d.mm.MountLayerWithDevices(containerID, id, idImagePath, isRoot, devicePaths, options.MountLabel)
+		mountPoint, layerUsedFuse, err := d.mm.MountLayer(containerID, id, spec, isRoot, options.MountLabel)
 		if err != nil {
 			return "", fmt.Errorf("failed to mount layer %s: %w", id, err)
 		}
@@ -818,6 +805,10 @@ func (d *Driver) SupportsShifting(uidmap, gidmap []idtools.IDMap) bool {
 
 func (d *Driver) dir(id string) string {
 	return filepath.Join(d.home, id)
+}
+
+func (d *Driver) createMountSpec(imagePath string) MountSpec {
+	return d.backend.CreateMountSpec(imagePath)
 }
 
 // homeDirForImageStore returns the home directory to use when an image store is configured.

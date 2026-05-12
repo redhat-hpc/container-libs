@@ -51,6 +51,15 @@ func (m *MockBackend) CreateImage(tarballPath, destImagePath string) (int64, err
 	return 0, nil
 }
 
+func (m *MockBackend) CreateMountSpec(imagePath string) MountSpec {
+	return MountSpec{
+		ImagePath:   imagePath,
+		FsType:      "erofs",
+		FuseCommand: "erofsfuse",
+		KernelFlags: []string{"noacl"},
+	}
+}
+
 func (m *MockBackend) MountLayers(ctx MountContext) ([]string, bool, error) {
 	return nil, false, ErrNotSupported
 }

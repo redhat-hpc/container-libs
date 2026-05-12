@@ -39,26 +39,15 @@ func (b *ErofsBackend) Info() BackendInfo {
 }
 
 func (b *ErofsBackend) CreateImage(tarballPath, destImagePath string) (int64, error) {
-	// Create EROFS image from tarball with --aufs flag.
-	// The --aufs flag tells mkfs.erofs to convert .wh.* files to overlayfs
-	// whiteout character devices automatically during EROFS creation.
-	//
-	// Compression support varies by erofs-utils version:
+	args := []string{"--tar=i", "-E", "legacy-compress"}
+
+	// Add compression algorithm if specified. Compression support varies by erofs-utils version:
 	// - 1.7.x: lz4, lz4hc, deflate, libdeflate
 	// - 1.8+:  lz4, lz4hc, deflate, lzma, zstd
-	args := []string{"--tar=i", "--aufs", "-E", "legacy-compress"}
-
-	// Add compression algorithm if specified
 	// Note: If the specified compressor is not available, mkfs.erofs will fail
 	// with a clear error message about unsupported compression algorithm
 	if b.compression != "" {
-		compressor := b.compression
-		// EROFS uses "deflate" while SquashFS uses "gzip"
-		// Map gzip -> deflate for EROFS since they're the same algorithm
-		if compressor == "gzip" {
-			compressor = "deflate"
-		}
-		args = append(args, "-z", compressor)
+		args = append(args, "-z", b.compression)
 	}
 
 	args = append(args, destImagePath, tarballPath)

@@ -138,13 +138,26 @@ func (b *ErofsBackend) MountLayers(ctx MountContext) ([]string, bool, error) {
 	}
 
 	// Mount the merged image
+	// The merged EROFS is metadata-only and needs device paths from all original layers
+	spec := MountSpec{
+		ImagePath:   mergedImagePath,
+		FsType:      "erofs",
+		FuseCommand: "erofsfuse",
+		KernelFlags: []string{"noacl"},
+		DevicePaths: devicePaths, // Use collected device paths from original layers
+	}
+	// Add FUSE arguments for device paths
+	for _, devicePath := range devicePaths {
+		spec.FuseArgs = append(spec.FuseArgs, "--device="+devicePath)
+	}
+	logrus.Debugf("[imagefs/erofs] Mounting merged EROFS with %d device paths: %v", len(devicePaths), devicePaths)
+
 	isRoot := os.Getuid() == 0
-	mountPoint, usedFuse, err := ctx.MountManager.MountLayerWithDevices(
+	mountPoint, usedFuse, err := ctx.MountManager.MountLayer(
 		ctx.ContainerID,
 		"merged-layers",
-		mergedImagePath,
+		spec,
 		isRoot,
-		devicePaths,
 		ctx.MountLabel,
 	)
 	if err != nil {
@@ -161,20 +174,15 @@ func (b *ErofsBackend) mountLayersSeparately(ctx MountContext, imagePaths []stri
 	for i, imagePath := range imagePaths {
 		layerID := ctx.LayerIDs[i]
 
-		// Get device paths for this specific layer
-		var layerDevicePaths []string
-		devicePath := imagePath + ".tar"
-		if fileutils.Exists(devicePath) == nil {
-			layerDevicePaths = append(layerDevicePaths, devicePath)
-		}
+		// Create EROFS-specific mount spec
+		spec := b.CreateMountSpec(imagePath)
 
 		isRoot := os.Getuid() == 0
-		mountPoint, layerUsedFuse, err := ctx.MountManager.MountLayerWithDevices(
+		mountPoint, layerUsedFuse, err := ctx.MountManager.MountLayer(
 			ctx.ContainerID,
 			layerID,
-			imagePath,
+			spec,
 			isRoot,
-			layerDevicePaths,
 			ctx.MountLabel,
 		)
 		if err != nil {
@@ -187,6 +195,26 @@ func (b *ErofsBackend) mountLayersSeparately(ctx MountContext, imagePaths []stri
 	}
 
 	return lowerDirs, usedFuse, nil
+}
+
+// CreateMountSpec creates an EROFS-specific mount specification.
+func (b *ErofsBackend) CreateMountSpec(imagePath string) MountSpec {
+	spec := MountSpec{
+		ImagePath:   imagePath,
+		FsType:      "erofs",
+		FuseCommand: "erofsfuse",
+		KernelFlags: []string{"noacl"}, // EROFS-specific: container images don't use ACLs
+	}
+
+	// Add .tar device file for metadata-only EROFS images
+	devicePath := imagePath + ".tar"
+	if fileutils.Exists(devicePath) == nil {
+		spec.DevicePaths = append(spec.DevicePaths, devicePath)
+		// FUSE arguments for device paths
+		spec.FuseArgs = append(spec.FuseArgs, "--device="+devicePath)
+	}
+
+	return spec
 }
 
 func (b *ErofsBackend) DiffForBaseLayer(imagePath string) (io.ReadCloser, error) {

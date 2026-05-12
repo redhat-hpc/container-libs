@@ -42,6 +42,27 @@ type MountContext struct {
 	GetImagePath func(id string) string
 }
 
+// MountSpec describes how to mount a single filesystem image.
+type MountSpec struct {
+	// ImagePath is the path to the image file
+	ImagePath string
+
+	// FsType is the filesystem type ("erofs" or "squashfs")
+	FsType string
+
+	// DevicePaths are external device files (EROFS-specific for metadata-only images)
+	DevicePaths []string
+
+	// FuseCommand is the FUSE mount command to use ("erofsfuse" or "squashfuse")
+	FuseCommand string
+
+	// FuseArgs are additional arguments for the FUSE command (e.g., "--device=/path")
+	FuseArgs []string
+
+	// KernelFlags are format-specific kernel mount flags (e.g., "noacl" for EROFS)
+	KernelFlags []string
+}
+
 // Backend handles format-specific operations for creating and managing filesystem images.
 type Backend interface {
 	// Info returns static backend properties.
@@ -51,9 +72,11 @@ type Backend interface {
 	// Returns the size of the original tarball in bytes.
 	CreateImage(tarballPath, destImagePath string) (int64, error)
 
+	// CreateMountSpec creates a format-specific mount specification for an image.
+	CreateMountSpec(imagePath string) MountSpec
+
 	// MountLayers mounts layers using backend-specific optimizations.
 	// Returns mount points (in bottom-to-top order), whether FUSE was used, and error.
-	// Returns ErrNotSupported if backend doesn't support optimized mounting.
 	MountLayers(ctx MountContext) ([]string, bool, error)
 
 	// DiffForBaseLayer returns a ReadCloser for the layer's diff.

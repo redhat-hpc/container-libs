@@ -8,9 +8,31 @@ Efficient container storage using immutable compressed filesystem images (EROFS 
 - **EROFS** (default): Enhanced Read-Only File System with legacy compression
 - **SquashFS**: Alternative with configurable compression (gzip, xz, lz4, zstd, lzo, lzma)
 
-**Configuration:**
-- `imagefs_format=erofs|squashfs` - Select format
-- `imagefs_compression=<algorithm>` - SquashFS compression (default: gzip)
+## Configuration
+
+### Via storage.conf
+
+Add to `/etc/containers/storage.conf` (system-wide) or `~/.config/containers/storage.conf` (rootless):
+
+```toml
+[storage]
+driver = "imagefs"
+
+[storage.options.imagefs]
+imagefs_format = "squashfs"          # Optional: "erofs" (default) or "squashfs"
+imagefs_compression = "zstd"         # Optional: SquashFS compression algorithm
+```
+
+### Via Command Line
+
+```bash
+podman --storage-driver imagefs --storage-opt imagefs_format=squashfs build .
+podman --storage-driver imagefs --storage-opt imagefs_compression=zstd run image
+```
+
+**Options:**
+- `imagefs_format=erofs|squashfs` - Select format (default: erofs)
+- `imagefs_compression=<algorithm>` - SquashFS compression: gzip (default), xz, lz4, zstd, lzo, lzma
 
 ## Architecture
 
@@ -125,27 +147,6 @@ The driver uses a clean backend abstraction to separate format-specific logic fr
 - **Working layers:** Tar the `upperdir` directly (avoids inode mismatch)
 - **Derived layers:** Use naiveDiff
 
-### User Namespace Support
-
-For `--userns` mappings, creates symlinks to template image files instead of copying:
-- EROFS: Links `layer.erofs` and `layer.erofs.tar`
-- SquashFS: Links `layer.sqfs`
-- UID/GID mapping handled by kernel at mount time
-
-## Critical Fixes
-
-### Whiteout Handling
-**Problem:** Deleted files reappeared in containers  
-**Solution:** `mkfs.erofs --aufs` converts `.wh.*` files to character devices overlayfs recognizes
-
-### Digest Preservation
-**Problem:** Image push failed with digest mismatches  
-**Solution:** Save original tarball, return it on export for EROFS base layers
-
-### Bloated Working Layer Diffs
-**Problem:** Intermediate build layers were 400MB instead of 3KB  
-**Solution:** Tar `upperdir` directly instead of using naiveDiff (avoids inode mismatch from double overlay mounts)
-
 ## Requirements
 
 ### Tools
@@ -229,10 +230,26 @@ Driver tracks which containers are currently mounted:
 - Cleared on `Put()` or during `Cleanup()`
 - Only actively mounted containers are cleaned up (not entire storage)
 
+## Known Issues
+
+### Mixed Format Storage
+
+**Problem:** Driver cannot mount layers when the storage format is switched (e.g., pulling with EROFS, then running with `--storage-opt imagefs_format=squashfs`)
+
+**Why it happens:**
+- `getImagePath()` only looks for files matching the current backend's extension
+- Existing EROFS layers have `layer.erofs`, but SquashFS backend searches for `layer.sqfs`
+- Backend's `MountLayers()` assumes all layers are in the same format
+
+**Workaround:** Clear storage (`podman system reset`) when switching formats
+
+**Proper fix would require:**
+- Backend-agnostic layer mounting logic in the driver layer
+- Format detection from file extensions rather than current backend
+- Mixed-format support in mount operations
+
 ## Future Work
 
-- Implement SquashFS whiteout conversion
-- Composefs integration
-- Zstd compression for EROFS
+- Mixed format storage support
 - Performance instrumentation
 - Direct tar-split streaming

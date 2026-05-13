@@ -24,11 +24,16 @@ type ErofsBackend struct {
 
 // NewErofsBackend creates a new EROFS backend.
 func NewErofsBackend(compression string) *ErofsBackend {
+	// Determine if we should preserve tarball based on compression mode:
+	// - No compression → metadata-only EROFS → preserve .tar for device mounting
+	// - With compression → full compressed EROFS → no .tar needed, use tar-split
+	preserveTarball := compression == ""
+
 	return &ErofsBackend{
 		info: BackendInfo{
 			Format:          FormatEROFS,
 			FileExtension:   ".erofs",
-			PreserveTarball: true, // EROFS needs tarball for --device= mounting
+			PreserveTarball: preserveTarball,
 		},
 		compression: compression,
 	}
@@ -39,15 +44,21 @@ func (b *ErofsBackend) Info() BackendInfo {
 }
 
 func (b *ErofsBackend) CreateImage(tarballPath, destImagePath string) (int64, error) {
-	args := []string{"--tar=i", "-E", "legacy-compress"}
+	var args []string
 
-	// Add compression algorithm if specified. Compression support varies by erofs-utils version:
-	// - 1.7.x: lz4, lz4hc, deflate, libdeflate
-	// - 1.8+:  lz4, lz4hc, deflate, lzma, zstd
-	// Note: If the specified compressor is not available, mkfs.erofs will fail
-	// with a clear error message about unsupported compression algorithm
-	if b.compression != "" {
-		args = append(args, "-z", b.compression)
+	if b.compression == "" {
+		// Metadata-only mode: create metadata-only EROFS that references .tar as device
+		args = []string{"--tar=i", "--aufs", "-E", "legacy-compress"}
+		logrus.Debugf("[imagefs] Creating metadata-only EROFS: %s -> %s", tarballPath, destImagePath)
+	} else {
+		// Full image mode: create compressed EROFS with actual data
+		// Compression support varies by erofs-utils version:
+		// - 1.7.x: lz4, lz4hc, deflate, libdeflate
+		// - 1.8+:  lz4, lz4hc, deflate, lzma, zstd
+		// Note: If the specified compressor is not available, mkfs.erofs will fail
+		// with a clear error message about unsupported compression algorithm
+		args = []string{"--aufs", "-z", b.compression}
+		logrus.Debugf("[imagefs] Creating full compressed EROFS with %s: %s -> %s", b.compression, tarballPath, destImagePath)
 	}
 
 	args = append(args, destImagePath, tarballPath)
@@ -55,11 +66,6 @@ func (b *ErofsBackend) CreateImage(tarballPath, destImagePath string) (int64, er
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 
-	compressionInfo := b.compression
-	if compressionInfo == "" {
-		compressionInfo = "none"
-	}
-	logrus.Debugf("[imagefs] Creating EROFS with compression %s: %v", compressionInfo, cmd.Args)
 	if err := cmd.Run(); err != nil {
 		return 0, fmt.Errorf("mkfs.erofs failed: %w: %s", err, stderr.String())
 	}
@@ -91,10 +97,18 @@ func (b *ErofsBackend) MountLayers(ctx MountContext) ([]string, bool, error) {
 		}
 		imagePaths = append(imagePaths, imagePath)
 
-		// Collect .tar device files for FUSE mounting
-		devicePath := imagePath + ".tar"
-		if fileutils.Exists(devicePath) == nil {
-			devicePaths = append(devicePaths, devicePath)
+		// Collect device paths based on compression mode:
+		// - No compression (metadata mode): use .tar files as devices
+		// - With compression (full image mode): use .erofs files as devices
+		if b.compression == "" {
+			// Metadata mode: look for .tar device files
+			devicePath := imagePath + ".tar"
+			if fileutils.Exists(devicePath) == nil {
+				devicePaths = append(devicePaths, devicePath)
+			}
+		} else {
+			// Full image mode: use .erofs files themselves as devices
+			devicePaths = append(devicePaths, imagePath)
 		}
 	}
 
@@ -107,7 +121,11 @@ func (b *ErofsBackend) MountLayers(ctx MountContext) ([]string, bool, error) {
 	}
 
 	// Use merged strategy
-	logrus.Debugf("[imagefs/erofs] Using merged layers strategy for %d layers", len(imagePaths))
+	compressionMode := "metadata-only"
+	if b.compression != "" {
+		compressionMode = fmt.Sprintf("compressed (%s)", b.compression)
+	}
+	logrus.Debugf("[imagefs/erofs] Using merged layers strategy for %d %s layers", len(imagePaths), compressionMode)
 	rundir := ctx.MountManager.GetRundir(ctx.ContainerID)
 	if err := os.MkdirAll(rundir, 0o755); err != nil {
 		return nil, false, fmt.Errorf("failed to create rundir: %w", err)
@@ -133,7 +151,7 @@ func (b *ErofsBackend) MountLayers(ctx MountContext) ([]string, bool, error) {
 		FsType:      "erofs",
 		FuseCommand: "erofsfuse",
 		KernelFlags: []string{"noacl"},
-		DevicePaths: devicePaths, // Use collected device paths from original layers
+		DevicePaths: devicePaths, // Device paths (.tar in metadata mode, .erofs in full mode)
 	}
 	// Add FUSE arguments for device paths
 	for _, devicePath := range devicePaths {
@@ -195,25 +213,34 @@ func (b *ErofsBackend) CreateMountSpec(imagePath string) MountSpec {
 		KernelFlags: []string{"noacl"}, // EROFS-specific: container images don't use ACLs
 	}
 
-	// Add .tar device file for metadata-only EROFS images
-	devicePath := imagePath + ".tar"
-	if fileutils.Exists(devicePath) == nil {
-		spec.DevicePaths = append(spec.DevicePaths, devicePath)
-		// FUSE arguments for device paths
-		spec.FuseArgs = append(spec.FuseArgs, "--device="+devicePath)
+	// For metadata-only EROFS (no compression), add .tar device file
+	// For full compressed EROFS, no device needed (data is in the .erofs)
+	if b.compression == "" {
+		devicePath := imagePath + ".tar"
+		if fileutils.Exists(devicePath) == nil {
+			spec.DevicePaths = append(spec.DevicePaths, devicePath)
+			// FUSE arguments for device paths
+			spec.FuseArgs = append(spec.FuseArgs, "--device="+devicePath)
+		}
 	}
 
 	return spec
 }
 
 func (b *ErofsBackend) DiffForBaseLayer(imagePath string) (io.ReadCloser, error) {
-	// For EROFS, return the original tarball to preserve exact digests
+	// For metadata-only EROFS (no compression), return the original tarball to preserve exact digests
+	// For full compressed EROFS, use tar-split reconstruction (return ErrNotSupported)
+	if b.compression != "" {
+		logrus.Debugf("[imagefs/erofs] Using tar-split for compressed EROFS layer: %s", imagePath)
+		return nil, ErrNotSupported
+	}
+
 	tarballPath := imagePath + ".tar"
 	if fileutils.Exists(tarballPath) != nil {
 		return nil, ErrNotSupported // Tarball doesn't exist, use naiveDiff
 	}
 
-	logrus.Debugf("[imagefs] Returning original tarball for EROFS layer: %s", tarballPath)
+	logrus.Debugf("[imagefs/erofs] Returning original tarball for metadata-only EROFS layer: %s", tarballPath)
 	f, err := os.Open(tarballPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open tarball %s: %w", tarballPath, err)

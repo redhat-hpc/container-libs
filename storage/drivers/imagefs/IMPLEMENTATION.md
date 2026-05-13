@@ -5,7 +5,9 @@
 Efficient container storage using immutable compressed filesystem images (EROFS or SquashFS) layered via OverlayFS. Minimizes file count and leverages compressed read-only filesystems.
 
 **Formats:**
-- **EROFS** (default): Enhanced Read-Only File System with legacy compression
+- **EROFS** (default): Enhanced Read-Only File System with configurable compression
+  - **Metadata-only mode** (no compression): Stores metadata in `.erofs`, references original `.tar` as device
+  - **Full image mode** (with compression): Creates compressed `.erofs` with all data, uses tar-split for digest preservation
 - **SquashFS**: Alternative with configurable compression (gzip, xz, lz4, zstd, lzo, lzma)
 
 ## Configuration
@@ -20,7 +22,9 @@ driver = "imagefs"
 
 [storage.options.imagefs]
 imagefs_format = "squashfs"          # Optional: "erofs" (default) or "squashfs"
-imagefs_compression = "zstd"         # Optional: SquashFS compression algorithm
+imagefs_compression = "zstd"         # Optional: compression algorithm
+                                     # EROFS: lz4, lz4hc, deflate, libdeflate, lzma, zstd
+                                     # SquashFS: gzip, xz, lz4, zstd, lzo, lzma
 ```
 
 ### Via Command Line
@@ -32,7 +36,9 @@ podman --storage-driver imagefs --storage-opt imagefs_compression=zstd run image
 
 **Options:**
 - `imagefs_format=erofs|squashfs` - Select format (default: erofs)
-- `imagefs_compression=<algorithm>` - SquashFS compression: gzip (default), xz, lz4, zstd, lzo, lzma
+- `imagefs_compression=<algorithm>` - Compression algorithm:
+  - EROFS: lz4, lz4hc, deflate, libdeflate, lzma, zstd (requires erofs-utils 1.7+)
+  - SquashFS: gzip (default), xz, lz4, zstd, lzo, lzma
 
 ## Architecture
 
@@ -40,8 +46,8 @@ podman --storage-driver imagefs --storage-opt imagefs_compression=zstd run image
 
 ```
 storage/imagefs/<layer_id>/
-├── layer.erofs           # EROFS image (format=erofs)
-├── layer.erofs.tar       # Original tarball (EROFS only, for device mounting)
+├── layer.erofs           # EROFS image (metadata-only or full compressed)
+├── layer.erofs.tar       # Original tarball (EROFS metadata-only mode for device mounting)
 ├── layer.sqfs            # SquashFS image (format=squashfs)
 ├── parent                # Parent layer ID
 ├── upper/                # Writable overlay layer
@@ -49,7 +55,7 @@ storage/imagefs/<layer_id>/
 └── merged/               # Final mounted filesystem
 ```
 
-**Note:** EROFS saves original tarball for device mounting and digest preservation. SquashFS does not.
+**Note:** EROFS metadata-only mode (no compression) saves `.tar` for device mounting and digest preservation. EROFS full mode (with compression) and SquashFS use tar-split for digest preservation.
 
 ### Mount Strategy
 
@@ -82,6 +88,27 @@ Uses modern syscalls for kernel mounts:
 
 For images with 50+ layers, uses reexec subprocess with `/proc/self/fd` file descriptors to shorten mount option strings and avoid kernel page size limits.
 
+### EROFS Modes
+
+EROFS supports two distinct modes based on compression settings:
+
+#### Metadata-Only Mode (no compression)
+- **Image creation:** `mkfs.erofs --tar=i --aufs -E legacy-compress layer.erofs layer.tar`
+- **Storage:** Keeps original `.tar` file alongside `.erofs`
+- **Mounting:** Uses `.tar` as external device via `--device=` flag
+- **Multi-device merge:** Merges metadata, references multiple `.tar` devices
+- **Diff export:** Returns original `.tar` for exact digest preservation
+- **Use case:** Default mode, optimal for digest matching without compression overhead
+
+#### Full Image Mode (with compression)
+- **Image creation:** `mkfs.erofs --aufs -z <algorithm> layer.erofs layer.tar`
+- **Storage:** No `.tar` preservation, only compressed `.erofs`
+- **Mounting:** Mounts `.erofs` directly (contains all data)
+- **Multi-device merge:** Merges metadata, references multiple `.erofs` devices
+- **Diff export:** Uses tar-split reconstruction (like SquashFS)
+- **Use case:** Space optimization with compression (lz4, lz4hc, deflate, lzma, zstd)
+- **Requirements:** erofs-utils 1.7+ for compression support
+
 ## Backend Architecture
 
 The driver uses a clean backend abstraction to separate format-specific logic from generic infrastructure:
@@ -96,10 +123,14 @@ The driver uses a clean backend abstraction to separate format-specific logic fr
 **MountSpec:** Describes how to mount an image with all format-specific details (filesystem type, device paths, FUSE command, kernel flags). This keeps MountManager completely generic.
 
 **EROFS Backend:**
-- Saves original `.tar` tarball for device mounting
-- Uses `mkfs.erofs --aufs` for automatic whiteout conversion
-- Mount spec includes device path and `noacl` kernel flag
-- **Merge optimization (kernel 5.14+):** Combines multiple EROFS images into one metadata-only image. Requires all original `.tar` device files for mounting.
+- **Dual mode operation:**  
+  - Metadata-only mode (no compression): Saves `.tar`, uses `--tar=i`, returns `.tar` for Diff
+  - Full image mode (with compression): No `.tar`, uses `-z`, returns ErrNotSupported for Diff (tar-split)
+- Uses `mkfs.erofs --aufs` for automatic whiteout conversion (both modes)
+- Mount spec includes `noacl` kernel flag and device paths:  
+  - Metadata mode: `.tar` files as devices
+  - Full mode: `.erofs` files as devices (for multi-device) or direct mount (single layer)
+- **Merge optimization (kernel 5.14+):** Combines multiple EROFS images into one metadata-only merged image that references all layer devices
 - Falls back to separate mounts on older kernels
 
 **SquashFS Backend:**
@@ -130,9 +161,14 @@ The driver uses a clean backend abstraction to separate format-specific logic fr
 
 ### Pulling Images (`ApplyDiff`)
 
-**EROFS:**
+**EROFS (Metadata-only mode - no compression):**
 1. Save original tarball as `layer.erofs.tar`
 2. Create EROFS with `mkfs.erofs --tar=i --aufs -E legacy-compress`
+
+**EROFS (Full image mode - with compression):**
+1. Save to temporary tarball
+2. Create compressed EROFS with `mkfs.erofs --aufs -z <algorithm>`
+3. Delete temporary file
 
 **SquashFS:**
 1. Save to temporary tarball
@@ -142,8 +178,9 @@ The driver uses a clean backend abstraction to separate format-specific logic fr
 ### Exporting Layers (`Diff`)
 
 **Strategy by layer type:**
-- **EROFS base layers:** Return original `.tar` file (digest preservation)
-- **SquashFS base layers:** Use naiveDiff
+- **EROFS metadata-only base layers:** Return original `.tar` file (digest preservation)
+- **EROFS full mode base layers:** Use tar-split reconstruction
+- **SquashFS base layers:** Use tar-split reconstruction
 - **Working layers:** Tar the `upperdir` directly (avoids inode mismatch)
 - **Derived layers:** Use naiveDiff
 
@@ -152,7 +189,7 @@ The driver uses a clean backend abstraction to separate format-specific logic fr
 ### Tools
 
 **EROFS:**
-- `mkfs.erofs` (v1.7+)
+- `mkfs.erofs` (v1.7+ for compression support; older versions support metadata-only mode)
 - `erofsfuse`
 
 **SquashFS:**
@@ -187,12 +224,14 @@ The driver uses a clean backend abstraction to separate format-specific logic fr
 
 | Feature | EROFS | SquashFS |
 |---------|-------|----------|
-| Tarball saved | Yes (`.tar`) | No |
+| Tarball saved | Metadata mode only | No |
 | Whiteout handling | Automatic (`--aufs`) | TODO |
-| Compression | Legacy only | Configurable |
+| Compression | Configurable (lz4, lz4hc, deflate, lzma, zstd) | Configurable (gzip, xz, lz4, zstd, lzo, lzma) |
+| Modes | Metadata-only (no compression) / Full (compressed) | Full only |
+| Digest preservation | Original `.tar` (metadata) / tar-split (full) | tar-split |
 | Merged strategy | Yes (5.14+) | No |
 | Kernel support | 5.4+ | 2.6.29+ |
-| Tools | mkfs.erofs, erofsfuse | sqfstar/tar2sqfs, squashfuse |
+| Tools | mkfs.erofs 1.7+, erofsfuse | sqfstar/tar2sqfs, squashfuse |
 
 ## Cleanup and Lifecycle
 

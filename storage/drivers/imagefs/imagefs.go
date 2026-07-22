@@ -528,17 +528,41 @@ func (d *Driver) Status() [][2]string {
 }
 
 func (d *Driver) Metadata(id string) (map[string]string, error) {
+	meta := make(map[string]string)
+
+	// Check if this is a committed image layer (has a filesystem image file).
 	path := d.getImagePath(id)
-	if path == "" {
+	if path != "" {
+		info := d.backend.Info()
+		meta["path"] = path
+		meta["format"] = info.Format
+		logrus.Debugf("[imagefs] Metadata for committed layer %s: %v", id, meta)
+		return meta, nil
+	}
+
+	// Fall back to directory-based metadata for writable container layers.
+	// Layers created by CreateReadWrite never have a committed image file
+	// (layer.erofs / layer.sqfs); they only have a directory with upper/,
+	// work/, and merged/ sub-directories.
+	var layerDir string
+	if d.imageStore != "" {
+		imageStoreDir := d.dirForImageStore(id)
+		if fileutils.Exists(imageStoreDir) == nil {
+			layerDir = imageStoreDir
+		}
+	}
+	if layerDir == "" {
+		layerDir = d.dir(id)
+	}
+
+	if err := fileutils.Exists(layerDir); err != nil {
 		return nil, fmt.Errorf("no image or directory found for layer %s", id)
 	}
 
-	info := d.backend.Info()
-	meta := make(map[string]string)
-	meta["path"] = path
-	meta["format"] = info.Format
-
-	logrus.Debugf("[imagefs] Metadata for layer identified: %v", meta)
+	meta["WorkDir"] = filepath.Join(layerDir, "work")
+	meta["UpperDir"] = filepath.Join(layerDir, "upper")
+	meta["MergedDir"] = filepath.Join(layerDir, "merged")
+	logrus.Debugf("[imagefs] Metadata for writable layer %s: %v", id, meta)
 	return meta, nil
 }
 

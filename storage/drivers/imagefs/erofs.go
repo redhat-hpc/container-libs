@@ -57,7 +57,7 @@ func (b *ErofsBackend) CreateImage(tarballPath, destImagePath string) (int64, er
 		// - 1.8+:  lz4, lz4hc, deflate, lzma, zstd
 		// Note: If the specified compressor is not available, mkfs.erofs will fail
 		// with a clear error message about unsupported compression algorithm
-		args = []string{"--aufs", "-z", b.compression}
+		args = []string{"--tar=f", "--aufs", "-z", b.compression}
 		logrus.Debugf("[imagefs] Creating full compressed EROFS with %s: %s -> %s", b.compression, tarballPath, destImagePath)
 	}
 
@@ -112,8 +112,10 @@ func (b *ErofsBackend) MountLayers(ctx MountContext) ([]string, bool, error) {
 		}
 	}
 
-	// Check if we can use the merged strategy
-	canMerge := kernel.CheckKernelVersion(5, 14, 0) && len(imagePaths) > 1
+	// Check if we can use the merged strategy.
+	// Merge (rebuild mode) only works with metadata-only EROFS (datalayout 0/1).
+	// Compressed EROFS created with --tar=f uses datalayout 2 which rebuild doesn't support.
+	canMerge := kernel.CheckKernelVersion(5, 14, 0) && len(imagePaths) > 1 && b.compression == ""
 
 	if !canMerge {
 		// Fall back to mounting layers separately

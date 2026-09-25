@@ -17,10 +17,14 @@ import (
 type SquashfsBackend struct {
 	info        BackendInfo
 	compression string
+	fuseCommand string
 }
 
 // NewSquashfsBackend creates a new SquashFS backend.
 func NewSquashfsBackend(compression string) *SquashfsBackend {
+	fuseCmd := detectFuseCommand()
+	logrus.Infof("[imagefs] SquashFS FUSE command: %s", fuseCmd)
+
 	return &SquashfsBackend{
 		info: BackendInfo{
 			Format:          FormatSquashFS,
@@ -28,6 +32,7 @@ func NewSquashfsBackend(compression string) *SquashfsBackend {
 			PreserveTarball: false, // Storage layer handles tar-split
 		},
 		compression: compression,
+		fuseCommand: fuseCmd,
 	}
 }
 
@@ -95,7 +100,7 @@ func (b *SquashfsBackend) CreateMountSpec(imagePath string) MountSpec {
 	return MountSpec{
 		ImagePath:   imagePath,
 		FsType:      "squashfs",
-		FuseCommand: "squashfuse",
+		FuseCommand: b.fuseCommand,
 		// SquashFS doesn't need device paths or special kernel flags
 	}
 }
@@ -144,6 +149,7 @@ func (b *SquashfsBackend) StatusFields() [][2]string {
 		fields = append(fields, [2]string{"squashfs-backend", toolType})
 	}
 	fields = append(fields, [2]string{"squashfs-tools", b.getVersion()})
+	fields = append(fields, [2]string{"squashfs-fuse", b.fuseCommand})
 
 	return fields
 }
@@ -156,6 +162,13 @@ func (b *SquashfsBackend) getToolType() string {
 		return "tar2sqfs"
 	}
 	return ""
+}
+
+func detectFuseCommand() string {
+	if _, err := exec.LookPath("squashfuse_ll"); err == nil {
+		return "squashfuse_ll"
+	}
+	return "squashfuse"
 }
 
 func (b *SquashfsBackend) getVersion() string {
